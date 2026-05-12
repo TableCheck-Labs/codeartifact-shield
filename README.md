@@ -10,6 +10,46 @@ cas registry    fail when the lockfile resolves packages from a non-allowed host
 cas scripts     fail when any lockfile entry will execute lifecycle scripts at install time
 ```
 
+## What changed in v0.3.0
+
+- **Severity badges in human output.** Every finding line gets a
+  `[CRITICAL]` / `[HIGH]` / `[MEDIUM]` / `[LOW]` / `[INFO]` prefix so
+  reviewers can triage when multiple gates fail in the same CI run.
+  Severities reflect blast radius (see table below), not finding count.
+- **`--json` flag on every subcommand.** Emits a stable, parseable schema
+  on stdout for downstream consumption (SARIF conversion, GitHub Code
+  Scanning, custom dashboards). Human-readable output continues to be
+  available without the flag.
+
+### Severity ladder
+
+| Severity | Type                                  | Meaning                                                    |
+| -------- | ------------------------------------- | ---------------------------------------------------------- |
+| CRITICAL | `registry_leak`, `insecure_scheme`    | Active route to untrusted bytes at next `npm install`      |
+| HIGH     | `direct_drift`, `transitive_drift`, `orphan_entry`, `install_script`, `sri_coverage_below_threshold` | Tampering signature, pending RCE, or missing integrity    |
+| MEDIUM   | `git_sourced`                         | Bypasses the registry contract (content-pinned to commit)  |
+| LOW      | `unresolved_phantom`                  | Suspicious-but-explainable lockfile entry                  |
+| INFO     | `bundled`, `install_script_allowed`   | Context only, not a failure                                |
+
+### `--json` output schema
+
+```json
+{
+  "command": "registry",
+  "lockfile": "/path/to/package-lock.json",
+  "clean": false,
+  "findings": [
+    {"severity": "CRITICAL", "type": "registry_leak", "lockfile_key": "...", "host": "..."}
+  ],
+  "severity_counts": {"CRITICAL": 1, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+}
+```
+
+Exit code is still 1 on any failure-tier finding; `--json` does not change
+gating, only the output format. All human-readable lines (banner text,
+warnings) are routed to stderr in `--json` mode so stdout remains a clean
+JSON document for piping into `jq` / SARIF converters.
+
 ## What changed in v0.2.0
 
 Security-driven changes; **some are breaking**. Review before upgrading.
