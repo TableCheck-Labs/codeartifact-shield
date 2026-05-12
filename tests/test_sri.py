@@ -204,3 +204,11 @@ def test_patch_lockfile_rejects_unsupported_version(tmp_path: Path) -> None:
             repository="r",
             boto3_session=_fake_session(_fake_client({})),
         )
+
+
+def test_verify_lockfile_rejects_v1(tmp_path: Path) -> None:
+    """v1 lockfiles must fail loudly, not silently report 0/0 = 100%."""
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text(json.dumps({"lockfileVersion": 1, "dependencies": {}}))
+    with pytest.raises(ValueError, match="unsupported lockfileVersion"):
+        verify_lockfile(lockfile)

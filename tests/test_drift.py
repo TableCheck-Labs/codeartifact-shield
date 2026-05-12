@@ -68,6 +68,26 @@ def test_checks_dev_dependencies(tmp_path: Path) -> None:
     assert report.mismatches == [("devDependencies", "vite", "5.0.0", "4.9.0")]
 
 
+def test_raises_on_missing_package_json(tmp_path: Path) -> None:
+    (tmp_path / "package-lock.json").write_text("{}")
+    try:
+        check_npm_drift(tmp_path)
+    except FileNotFoundError as exc:
+        assert "package.json" in str(exc)
+    else:
+        raise AssertionError("expected FileNotFoundError")
+
+
+def test_raises_on_missing_lockfile(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text("{}")
+    try:
+        check_npm_drift(tmp_path)
+    except FileNotFoundError as exc:
+        assert "package-lock.json" in str(exc)
+    else:
+        raise AssertionError("expected FileNotFoundError")
+
+
 def test_ignores_transitives(tmp_path: Path) -> None:
     """Only direct deps are checked; transitives aren't declared in package.json."""
     root = _write_pair(

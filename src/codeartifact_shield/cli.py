@@ -109,7 +109,11 @@ def sri_verify(lockfile: Path, min_coverage: float) -> None:
     Pair with ``cas sri patch`` in a precommit or CI job so the lockfile
     is always integrity-complete before merge.
     """
-    with_integrity, total = verify_lockfile(lockfile)
+    try:
+        with_integrity, total = verify_lockfile(lockfile)
+    except ValueError as exc:
+        click.echo(f"FAIL — {exc}", err=True)
+        sys.exit(1)
     coverage = 100.0 * with_integrity / total if total else 100.0
     click.echo(
         f"SRI integrity coverage: {with_integrity}/{total} ({coverage:.2f}%)"
@@ -140,7 +144,11 @@ def drift_cmd(frontend_dir: Path) -> None:
     other — exactly the inconsistent state an attacker would create by
     tampering with the lockfile alone.
     """
-    report = check_npm_drift(frontend_dir)
+    try:
+        report = check_npm_drift(frontend_dir)
+    except FileNotFoundError as exc:
+        click.echo(f"SKIP — {exc}", err=True)
+        sys.exit(1)
     if report.clean:
         click.echo("OK — package.json and package-lock.json agree on direct-dep versions.")
         return

@@ -32,8 +32,14 @@ def check_npm_drift(frontend_dir: Path) -> DriftReport:
     Transitives aren't checked because the package.json doesn't declare
     them; their integrity is the lockfile's responsibility alone.
     """
-    pkg = json.loads((frontend_dir / "package.json").read_text())
-    lock = json.loads((frontend_dir / "package-lock.json").read_text())
+    pkg_path = frontend_dir / "package.json"
+    lock_path = frontend_dir / "package-lock.json"
+    if not pkg_path.exists():
+        raise FileNotFoundError(f"no package.json in {frontend_dir}")
+    if not lock_path.exists():
+        raise FileNotFoundError(f"no package-lock.json in {frontend_dir}")
+    pkg = json.loads(pkg_path.read_text())
+    lock = json.loads(lock_path.read_text())
     lock_pkgs = lock.get("packages", {})
 
     report = DriftReport()

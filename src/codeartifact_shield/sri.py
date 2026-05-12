@@ -238,8 +238,16 @@ def verify_lockfile(lockfile_path: Path) -> tuple[int, int]:
 
     Doesn't talk to CodeArtifact — pure lockfile read. The CLI uses this
     as the basis for a fail-on-missing-SRI gate.
+
+    Raises ``ValueError`` for unsupported lockfile versions (v1) — silently
+    returning 0/0 would let a v1 lockfile pass a 100%-coverage gate.
     """
     lock = json.loads(lockfile_path.read_text())
+    lf_version = lock.get("lockfileVersion")
+    if lf_version not in (2, 3):
+        raise ValueError(
+            f"unsupported lockfileVersion {lf_version}; only v2 and v3 are supported"
+        )
     total = 0
     with_integrity = 0
     for _key, entry in _iter_lockfile_packages(lock):
