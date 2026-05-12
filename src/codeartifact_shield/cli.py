@@ -34,6 +34,7 @@ from typing import Any
 import click
 
 from codeartifact_shield import __version__
+from codeartifact_shield._http import DEFAULT_RETRIES
 from codeartifact_shield._output import (
     Severity,
     emit_json,
@@ -1019,6 +1020,19 @@ _AUDIT_SEVERITY_TO_CAS = {
     ),
 )
 @click.option(
+    "--retries",
+    type=int,
+    default=DEFAULT_RETRIES,
+    show_default=True,
+    envvar="CAS_RETRIES",
+    help=(
+        "How many times to retry a transient HTTP error (network "
+        "unreachable, 5xx, 429) before failing. Default 2 (3 total "
+        "attempts) with exponential backoff. `0` disables retry. "
+        "Shared with `cas cooldown` via `CAS_RETRIES`."
+    ),
+)
+@click.option(
     "--probe-cache",
     "probe_cache_path",
     type=click.Path(dir_okay=False, path_type=Path),
@@ -1049,6 +1063,7 @@ def audit_cmd(
     ca_repository: str | None,
     ca_domain_owner: str | None,
     max_workers: int,
+    retries: int,
     probe_cache_path: Path | None,
     json_output: bool,
 ) -> None:
@@ -1092,6 +1107,7 @@ def audit_cmd(
             trusted_endpoints=trusted_endpoints or None,
             probe_cache_path=probe_cache_path,
             max_workers=max_workers,
+            retries=retries,
         )
     except ValueError as exc:
         _emit_load_error(json_output, "audit", lockfile, exc)
@@ -1326,6 +1342,19 @@ def audit_cmd(
     ),
 )
 @click.option(
+    "--retries",
+    type=int,
+    default=DEFAULT_RETRIES,
+    show_default=True,
+    envvar="CAS_RETRIES",
+    help=(
+        "How many times to retry a transient HTTP error (network "
+        "unreachable, 5xx, 429) before failing. Default 2 (3 total "
+        "attempts) with exponential backoff. `0` disables retry. "
+        "Shared with `cas audit` via `CAS_RETRIES`."
+    ),
+)
+@click.option(
     "--json",
     "json_output",
     is_flag=True,
@@ -1343,6 +1372,7 @@ def cooldown_cmd(
     ca_first: bool,
     cache_path: Path | None,
     max_workers: int,
+    retries: int,
     json_output: bool,
 ) -> None:
     """Fail if any installed version is younger than --min-age days."""
@@ -1381,6 +1411,7 @@ def cooldown_cmd(
             endpoints=endpoints,
             cache_path=cache_path,
             max_workers=max_workers,
+            retries=retries,
         )
     except ValueError as exc:
         _emit_load_error(json_output, "cooldown", lockfile, exc)

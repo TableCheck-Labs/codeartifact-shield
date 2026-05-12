@@ -73,7 +73,9 @@ def _mock_responses(by_name: dict[str, dict[str, Any] | int]):
     (typically 404 to simulate "not found on this registry").
     """
 
-    def mock_get(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
+    def mock_get(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
         # Last URL segment is the (URL-encoded) package name.
         name = url.rsplit("/", 1)[-1]
         # urllib.parse.quote turns "@" into "@" (safe) and "/" into "%2F" — but
@@ -179,7 +181,9 @@ def test_cooldown_private_no_data_surfaced_when_only_npm_endpoint(
 def test_cooldown_network_error_surfaced(tmp_path: Path) -> None:
     lf = _write_lock(tmp_path, {"node_modules/sumthing": {"version": "1.0.0"}})
 
-    def mock(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
         raise urllib.error.URLError("connection refused")
 
     with patch("codeartifact_shield.cooldown._http_get_json", mock):
@@ -203,7 +207,9 @@ def test_cooldown_falls_back_to_codeartifact_on_404(tmp_path: Path) -> None:
     now = _now(2024, 1, 15)
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-    def mock(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
         if "codeartifact" in url:
             # Confirm the bearer token was attached.
             assert auth_header == "Bearer fake-token"
@@ -233,7 +239,9 @@ def test_cooldown_ca_first_order(tmp_path: Path) -> None:
     lf = _write_lock(tmp_path, {"node_modules/lodash": {"version": "4.17.21"}})
     queried_hosts: list[str] = []
 
-    def mock(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
         queried_hosts.append(url)
         return {"time": {"4.17.21": "2021-02-21T02:46:48.218Z"}}
 
@@ -261,7 +269,9 @@ def test_cooldown_only_ca_endpoint_handles_404_as_private(tmp_path: Path) -> Non
         tmp_path, {"node_modules/@my/typo": {"version": "1.0.0"}}
     )
 
-    def mock(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
         raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
 
     endpoints = [
@@ -287,7 +297,9 @@ def test_cooldown_skips_workspace_link_entries(tmp_path: Path) -> None:
     )
     queried: list[str] = []
 
-    def mock(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
         queried.append(url)
         return {"time": {"1.0.0": "2020-01-01T00:00:00.000Z"}}
 
@@ -307,7 +319,9 @@ def test_cooldown_dedupes_same_name_version(tmp_path: Path) -> None:
     )
     queried: list[str] = []
 
-    def mock(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
         queried.append(url)
         return {"time": {"1.0.0": "2020-01-01T00:00:00.000Z"}}
 
@@ -356,7 +370,9 @@ def test_cooldown_uses_name_field_for_npm_aliases(tmp_path: Path) -> None:
     )
     queried_names: list[str] = []
 
-    def mock(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
         queried_names.append(url.rsplit("/", 1)[-1])
         return {"time": {"4.2.3": "2020-01-01T00:00:00.000Z"}}
 
@@ -379,7 +395,9 @@ def test_cooldown_falls_through_when_version_missing_from_time_dict(
     now = _now(2024, 1, 15)
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-    def mock(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
         if "registry.npmjs.org" in url:
             # Public registry: returns 200 with a placeholder `time` that
             # doesn't contain version 2.0.0.
@@ -408,7 +426,9 @@ def test_cooldown_typosquat_of_nothing_is_high(tmp_path: Path) -> None:
     # doesn't exist anywhere. Used to be silently INFO; now HIGH.
     lf = _write_lock(tmp_path, {"node_modules/lodahzzz": {"version": "1.0.0"}})
 
-    def mock(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
         raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
 
     with patch("codeartifact_shield.cooldown._http_get_json", mock):
@@ -426,7 +446,9 @@ def test_cooldown_allow_private_demotes_to_info(tmp_path: Path) -> None:
         },
     )
 
-    def mock(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
         raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
 
     with patch("codeartifact_shield.cooldown._http_get_json", mock):
@@ -456,7 +478,7 @@ def test_cooldown_parallel_dispatches_concurrently(tmp_path: Path) -> None:
     lf = _write_lock(tmp_path, pkgs)
 
     def slow_mock(
-        url: str, timeout: int, auth_header: str | None = None
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
     ) -> dict[str, Any]:
         time.sleep(0.05)
         return {"time": {"1.0.0": "2020-01-01T00:00:00.000Z"}}
@@ -488,7 +510,7 @@ def test_cooldown_serial_when_max_workers_is_one(tmp_path: Path) -> None:
     )
 
     def slow_mock(
-        url: str, timeout: int, auth_header: str | None = None
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
     ) -> dict[str, Any]:
         time.sleep(0.05)
         return {"time": {"1.0.0": "2020-01-01T00:00:00.000Z"}}
@@ -518,7 +540,9 @@ def test_cooldown_cache_hit_avoids_http(tmp_path: Path) -> None:
     )
     http_calls: list[str] = []
 
-    def mock(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
         http_calls.append(url)
         raise AssertionError("HTTP must not be called on cache hit")
 
@@ -534,7 +558,9 @@ def test_cooldown_cache_miss_fetches_and_persists(tmp_path: Path) -> None:
     lf = _write_lock(tmp_path, {"node_modules/lodash": {"version": "4.17.21"}})
     cache_file = tmp_path / "cache.json"  # doesn't exist yet
 
-    def mock(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
         return {
             "time": {
                 "4.17.20": "2020-07-09T18:46:44.196Z",
@@ -567,7 +593,9 @@ def test_cooldown_corrupt_cache_falls_back_silently(tmp_path: Path) -> None:
     cache_file = tmp_path / "cache.json"
     cache_file.write_text("{not valid json")  # corrupt
 
-    def mock(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
         return {"time": {"4.17.21": "2021-02-21T02:46:48.218Z"}}
 
     with patch("codeartifact_shield.cooldown._http_get_json", mock):
@@ -586,7 +614,7 @@ def test_cooldown_cache_aggressive_populate_helps_next_run(tmp_path: Path) -> No
     cache_file = tmp_path / "cache.json"
 
     def mock_first(
-        url: str, timeout: int, auth_header: str | None = None
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
     ) -> dict[str, Any]:
         return {
             "time": {
@@ -620,7 +648,7 @@ def test_cooldown_cache_aggressive_populate_helps_next_run(tmp_path: Path) -> No
     )
 
     def mock_second(
-        url: str, timeout: int, auth_header: str | None = None
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
     ) -> dict[str, Any]:
         raise AssertionError("must not hit HTTP — answer is in the cache")
 
@@ -629,3 +657,124 @@ def test_cooldown_cache_aggressive_populate_helps_next_run(tmp_path: Path) -> No
     assert report.cache_hits == 1
     assert report.cache_misses == 0
     assert report.clean
+
+
+# ---------------------------------------------------------------------------
+# Resilient fallthrough — a transient error on one endpoint must not fail
+# the build when a later endpoint successfully resolves the same name.
+# ---------------------------------------------------------------------------
+
+
+def test_cooldown_endpoint1_error_endpoint2_resolves_is_clean(
+    tmp_path: Path,
+) -> None:
+    """Public registry blips (URLError) but CA resolves the package —
+    no spurious network_error in the report.
+
+    Regression guard for the v0.7.1 CI failure:
+        [HIGH] @vitest/expect (registry.npmjs.org):
+          <urlopen error [Errno 101] Network is unreachable>
+    """
+    lf = _write_lock(tmp_path, {"node_modules/lodash": {"version": "4.17.21"}})
+    now = _now(2024, 1, 15)
+
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        if "registry.npmjs.org" in url:
+            raise urllib.error.URLError("network unreachable")
+        if "codeartifact" in url:
+            return {"time": {"4.17.21": "2021-02-21T02:46:48.218Z"}}
+        raise AssertionError(f"unexpected URL: {url}")
+
+    endpoints = [
+        RegistryEndpoint(url="https://registry.npmjs.org", label="registry.npmjs.org"),
+        RegistryEndpoint(
+            url="https://my-ca.d.codeartifact.us-east-1.amazonaws.com/npm/repo",
+            auth_header="Bearer xxx",
+            label="my-ca",
+        ),
+    ]
+    with patch("codeartifact_shield.cooldown._http_get_json", mock):
+        report = check_cooldown(lf, endpoints=endpoints, now=now)
+    assert report.network_errors == []
+    assert report.private_blocked == []
+    assert report.clean
+
+
+def test_cooldown_error_on_all_endpoints_surfaces_network_error(
+    tmp_path: Path,
+) -> None:
+    """If every endpoint errors and the name is never resolved, the first
+    error should surface — not vanish into ``private_blocked``."""
+    lf = _write_lock(tmp_path, {"node_modules/something": {"version": "1.0.0"}})
+
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        raise urllib.error.URLError("network unreachable")
+
+    endpoints = [
+        RegistryEndpoint(url="https://registry.npmjs.org", label="registry.npmjs.org"),
+        RegistryEndpoint(
+            url="https://my-ca.d.codeartifact.us-east-1.amazonaws.com/npm/repo",
+            auth_header="Bearer xxx",
+            label="my-ca",
+        ),
+    ]
+    with patch("codeartifact_shield.cooldown._http_get_json", mock):
+        report = check_cooldown(lf, endpoints=endpoints, now=_now())
+    assert len(report.network_errors) == 1
+    assert "network unreachable" in report.network_errors[0]
+    assert "something" in report.network_errors[0]
+    assert report.private_blocked == []
+    assert not report.clean
+
+
+def test_cooldown_error_then_404_then_resolved_is_clean(tmp_path: Path) -> None:
+    """Three endpoints: first errors, second 404s, third resolves. Should be
+    clean — the error on endpoint 1 is wiped once endpoint 3 succeeds."""
+    lf = _write_lock(tmp_path, {"node_modules/@my/pkg": {"version": "1.0.0"}})
+    now = _now(2024, 1, 15)
+    old = (now - timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        if "ep1" in url:
+            raise urllib.error.URLError("transient")
+        if "ep2" in url:
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
+        if "ep3" in url:
+            return {"time": {"1.0.0": old}}
+        raise AssertionError(f"unexpected URL: {url}")
+
+    endpoints = [
+        RegistryEndpoint(url="https://ep1.example.com", label="ep1"),
+        RegistryEndpoint(url="https://ep2.example.com", label="ep2"),
+        RegistryEndpoint(url="https://ep3.example.com", label="ep3"),
+    ]
+    with patch("codeartifact_shield.cooldown._http_get_json", mock):
+        report = check_cooldown(lf, endpoints=endpoints, now=now)
+    assert report.clean
+    assert report.network_errors == []
+
+
+def test_cooldown_error_does_not_leak_into_private_blocked(
+    tmp_path: Path,
+) -> None:
+    """Single-endpoint error must NOT silently end up in ``private_blocked``.
+    A blocked-private finding is a different signal than a transient error
+    — confusing them was the v0.7.1 misclassification."""
+    lf = _write_lock(tmp_path, {"node_modules/lodash": {"version": "4.17.21"}})
+
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        raise urllib.error.URLError("network unreachable")
+
+    with patch("codeartifact_shield.cooldown._http_get_json", mock):
+        report = check_cooldown(lf, now=_now())
+    assert "lodash@4.17.21" not in report.private_blocked
+    assert report.private_blocked == []
+    assert len(report.network_errors) == 1

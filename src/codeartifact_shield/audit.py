@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from codeartifact_shield._http import DEFAULT_RETRIES, with_retry
 from codeartifact_shield._lockfile import extract_package_name, load_lockfile
 from codeartifact_shield._registry import RegistryEndpoint, package_url
 
@@ -105,7 +106,10 @@ class AuditReport:
         )
 
 
-def _http_post_json(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+def _http_post_json_once(
+    url: str, body: dict[str, Any], timeout: int
+) -> dict[str, Any]:
+    """Single HTTP POST — no retry. Patch in retry-aware tests."""
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -118,9 +122,22 @@ def _http_post_json(url: str, body: dict[str, Any], timeout: int) -> dict[str, A
         return payload
 
 
-def _http_get_json(
+def _http_post_json(
+    url: str,
+    body: dict[str, Any],
+    timeout: int,
+    retries: int = DEFAULT_RETRIES,
+) -> dict[str, Any]:
+    """HTTP POST with retry on transient errors."""
+    return with_retry(
+        lambda: _http_post_json_once(url, body, timeout), retries=retries
+    )
+
+
+def _http_get_json_once(
     url: str, timeout: int, auth_header: str | None = None
 ) -> dict[str, Any]:
+    """Single HTTP GET — no retry. Patch in retry-aware tests."""
     headers: dict[str, str] = {"Accept": "application/json"}
     if auth_header:
         headers["Authorization"] = auth_header
@@ -128,6 +145,19 @@ def _http_get_json(
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
         payload: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
         return payload
+
+
+def _http_get_json(
+    url: str,
+    timeout: int,
+    auth_header: str | None = None,
+    retries: int = DEFAULT_RETRIES,
+) -> dict[str, Any]:
+    """HTTP GET with retry on transient errors."""
+    return with_retry(
+        lambda: _http_get_json_once(url, timeout, auth_header),
+        retries=retries,
+    )
 
 
 def _extract_severity(vuln: dict[str, Any]) -> str:
@@ -162,18 +192,10 @@ def _meets_floor(severity: str, floor: str) -> bool:
     return SEVERITY_RANK.get(severity, 0) >= SEVERITY_RANK.get(floor.upper(), 0)
 
 
-def _http_head_status(
+def _http_head_status_once(
     url: str, timeout: int, auth_header: str | None = None
 ) -> int:
-    """Issue a HEAD request and return the HTTP status code.
-
-    Used by the probe phase, which only needs existence-or-not (200 vs
-    404) — not the response body. Switching from GET to HEAD on
-    registry.npmjs.org cuts bytes transferred per probe from ~250KB to
-    near zero (the registry returns full package metadata on GET even
-    when we don't need it). Across a 2500-package audit, this is the
-    difference between 600 MB and a few KB downloaded.
-    """
+    """Single HEAD request — no retry. Patch in retry-aware tests."""
     headers: dict[str, str] = {"Accept": "application/json"}
     if auth_header:
         headers["Authorization"] = auth_header
@@ -183,16 +205,35 @@ def _http_head_status(
         return status
 
 
-def _probe_endpoint(endpoint: RegistryEndpoint, name: str, timeout: int) -> str:
-    """Return ``"found"`` if the registry has metadata for ``name``,
-    ``"404"`` if explicitly absent, ``"error"`` on any other failure.
+def _http_head_status(
+    url: str,
+    timeout: int,
+    auth_header: str | None = None,
+    retries: int = DEFAULT_RETRIES,
+) -> int:
+    """HEAD with retry on transient errors. Used by the probe phase —
+    only the status code matters, not the body."""
+    return with_retry(
+        lambda: _http_head_status_once(url, timeout, auth_header),
+        retries=retries,
+    )
 
-    Uses a HEAD request — the registry-existence check doesn't need the
-    full metadata body.
+
+def _probe_endpoint(
+    endpoint: RegistryEndpoint,
+    name: str,
+    timeout: int,
+    retries: int = DEFAULT_RETRIES,
+) -> str:
+    """Return ``"found"`` if the registry has metadata for ``name``,
+    ``"404"`` if explicitly absent, ``"error"`` on any other failure
+    (after retries are exhausted).
     """
     url = package_url(endpoint, name)
     try:
-        _http_head_status(url, timeout=timeout, auth_header=endpoint.auth_header)
+        _http_head_status(
+            url, timeout=timeout, auth_header=endpoint.auth_header, retries=retries
+        )
         return "found"
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -211,6 +252,7 @@ def _probe_parallel(
     names: Iterable[str],
     timeout: int,
     max_workers: int,
+    retries: int = DEFAULT_RETRIES,
 ) -> dict[str, str]:
     """Probe many package names against one endpoint concurrently.
 
@@ -224,7 +266,7 @@ def _probe_parallel(
     workers = max(1, min(max_workers, len(name_list)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(_probe_endpoint, endpoint, name, timeout): name
+            pool.submit(_probe_endpoint, endpoint, name, timeout, retries): name
             for name in name_list
         }
         for future in as_completed(futures):
@@ -287,6 +329,7 @@ def audit_lockfile(
     trusted_endpoints: Iterable[RegistryEndpoint] | None = None,
     probe_cache_path: Path | None = None,
     max_workers: int = DEFAULT_PROBE_WORKERS,
+    retries: int = DEFAULT_RETRIES,
     timeout: int = OSV_TIMEOUT_SECONDS,
 ) -> AuditReport:
     """Audit every (name, version) pair in the lockfile against OSV.dev.
@@ -333,7 +376,7 @@ def audit_lockfile(
         for chunk_start in range(0, len(queries), OSV_BATCH_SIZE):
             chunk = queries[chunk_start : chunk_start + OSV_BATCH_SIZE]
             payload = _http_post_json(
-                batch_endpoint, {"queries": chunk}, timeout=timeout
+                batch_endpoint, {"queries": chunk}, timeout=timeout, retries=retries
             )
             for entry in payload.get("results", []):
                 ids = [v["id"] for v in entry.get("vulns", []) if "id" in v]
@@ -352,7 +395,9 @@ def audit_lockfile(
         detail_workers = max(1, min(max_workers, len(sorted_ids)))
 
         def fetch_detail(vid: str) -> tuple[str, dict[str, Any]]:
-            return vid, _http_get_json(f"{vuln_endpoint}/{vid}", timeout=timeout)
+            return vid, _http_get_json(
+                f"{vuln_endpoint}/{vid}", timeout=timeout, retries=retries
+            )
 
         try:
             with ThreadPoolExecutor(max_workers=detail_workers) as pool:
@@ -397,11 +442,17 @@ def audit_lockfile(
             load_probe_cache(probe_cache_path) if probe_cache_path else {}
         )
 
+        # Track per-name outcomes across endpoints. A name is resolved if
+        # ANY endpoint returned 200 ("found"). An endpoint error is NOT
+        # an immediate build failure — fall through to the next endpoint
+        # and only surface as network_error if the name never resolves.
+        confirmed_via: dict[str, str] = {}  # name → endpoint label (200)
+        seen_any_404: dict[str, bool] = dict.fromkeys(candidates, False)
+        seen_error: dict[str, str] = {}  # name → first error endpoint label
+
         def query_with_cache(
             endpoint: RegistryEndpoint, names: list[str]
         ) -> dict[str, str]:
-            """Resolve probe results for ``names`` on one endpoint, hitting
-            the cache first and HTTP only for misses."""
             cached_section = probe_cache.get(endpoint.label, {})
             results: dict[str, str] = {}
             uncached: list[str] = []
@@ -413,7 +464,11 @@ def audit_lockfile(
                     uncached.append(n)
             if uncached:
                 fresh = _probe_parallel(
-                    endpoint, uncached, timeout=timeout, max_workers=max_workers
+                    endpoint,
+                    uncached,
+                    timeout=timeout,
+                    max_workers=max_workers,
+                    retries=retries,
                 )
                 section = probe_cache.setdefault(endpoint.label, {})
                 for n, status in fresh.items():
@@ -423,51 +478,61 @@ def audit_lockfile(
             return results
 
         # Phase 1 — parallel probe against the public probe registry.
-        unresolved_after_phase1: list[str] = []
         if probe_endpoint is not None and candidates:
             phase1_results = query_with_cache(probe_endpoint, candidates)
             for name, result in phase1_results.items():
                 if result == "found":
-                    continue
-                if result == "error":
-                    report.network_error = (
-                        f"Private-package probe failed for {name} "
-                        f"(probe-registry)"
-                    )
-                    return report
-                unresolved_after_phase1.append(name)
-            unresolved_after_phase1.sort()
-        else:
-            unresolved_after_phase1 = list(candidates)
+                    confirmed_via[name] = "probe-registry"
+                elif result == "404":
+                    seen_any_404[name] = True
+                else:  # "error"
+                    seen_error.setdefault(name, "probe-registry")
 
-        # Phase 2 — for each trusted endpoint in order, parallel-probe the
-        # names still unresolved. A 200 on any trusted endpoint demotes
-        # the finding to INFO (trusted-private).
-        confirmed_trusted: set[str] = set()
-        pending = list(unresolved_after_phase1)
+        # Phase 2 — for each trusted endpoint in order, parallel-probe
+        # the names still unresolved. Probe errors fall through.
         for endpoint in trusted_list:
+            pending = sorted(
+                n for n in candidates if n not in confirmed_via
+            )
             if not pending:
                 break
             phase2_results = query_with_cache(endpoint, pending)
-            still_pending: list[str] = []
             for name, result in phase2_results.items():
                 if result == "found":
-                    confirmed_trusted.add(name)
-                elif result == "error":
-                    report.network_error = (
-                        f"Private-package probe failed for {name} "
-                        f"({endpoint.label})"
-                    )
-                    return report
-                else:
-                    still_pending.append(name)
-            pending = sorted(still_pending)
+                    confirmed_via[name] = endpoint.label
+                elif result == "404":
+                    seen_any_404[name] = True
+                else:  # "error"
+                    seen_error.setdefault(name, endpoint.label)
 
-        for name in unresolved_after_phase1:
-            if name in confirmed_trusted or name.lower() in unaudited_allowlist:
+        for name in candidates:
+            via = confirmed_via.get(name)
+            if via == "probe-registry":
+                # Public + no OSV findings → silently clean.
+                continue
+            if via is not None:
+                # Resolved on a trusted endpoint → INFO.
                 report.unaudited_allowed.append(name)
-            else:
+                continue
+            if name.lower() in unaudited_allowlist:
+                report.unaudited_allowed.append(name)
+                continue
+            if seen_any_404.get(name) and name not in seen_error:
+                # 404'd cleanly on every endpoint we asked → known-blocked.
                 report.unaudited_blocked.append(name)
+                continue
+            if name in seen_error:
+                # No endpoint resolved it AND at least one errored — we
+                # genuinely couldn't determine. Surface the first error as
+                # the build-failing finding.
+                report.network_error = (
+                    f"Private-package probe failed for {name} "
+                    f"({seen_error[name]})"
+                )
+                return report
+            # Defensive fallback: no resolution, no 404, no error. Should
+            # be unreachable but treat as blocked rather than silently OK.
+            report.unaudited_blocked.append(name)
 
         if probe_cache_path is not None:
             try:

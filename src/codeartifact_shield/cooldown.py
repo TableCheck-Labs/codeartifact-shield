@@ -49,6 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from codeartifact_shield._http import DEFAULT_RETRIES, with_retry
 from codeartifact_shield._lockfile import extract_package_name, load_lockfile
 from codeartifact_shield._registry import (
     RegistryEndpoint,
@@ -128,9 +129,10 @@ class CooldownReport:
         )
 
 
-def _http_get_json(
+def _http_get_json_once(
     url: str, timeout: int, auth_header: str | None = None
 ) -> dict[str, Any]:
+    """Single HTTP GET — no retry. Patch this in retry-aware tests."""
     headers: dict[str, str] = {"Accept": "application/json"}
     if auth_header:
         headers["Authorization"] = auth_header
@@ -138,6 +140,21 @@ def _http_get_json(
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
         payload: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
         return payload
+
+
+def _http_get_json(
+    url: str,
+    timeout: int,
+    auth_header: str | None = None,
+    retries: int = DEFAULT_RETRIES,
+) -> dict[str, Any]:
+    """HTTP GET with retry on transient errors. Existing tests that patch
+    this function bypass retry entirely — that's intentional, they're
+    asserting deterministic outcomes."""
+    return with_retry(
+        lambda: _http_get_json_once(url, timeout, auth_header),
+        retries=retries,
+    )
 
 
 def _parse_iso8601(value: str) -> datetime:
@@ -216,11 +233,16 @@ class _FetchResult:
 
 
 def _fetch_one(
-    endpoint: RegistryEndpoint, name: str, timeout: int
+    endpoint: RegistryEndpoint,
+    name: str,
+    timeout: int,
+    retries: int = DEFAULT_RETRIES,
 ) -> _FetchResult:
     url = package_url(endpoint, name)
     try:
-        metadata = _http_get_json(url, timeout=timeout, auth_header=endpoint.auth_header)
+        metadata = _http_get_json(
+            url, timeout=timeout, auth_header=endpoint.auth_header, retries=retries
+        )
         return _FetchResult(name=name, status="ok", metadata=metadata)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -244,6 +266,7 @@ def _fetch_endpoint_parallel(
     names: Iterable[str],
     timeout: int,
     max_workers: int,
+    retries: int = DEFAULT_RETRIES,
 ) -> dict[str, _FetchResult]:
     results: dict[str, _FetchResult] = {}
     name_list = list(names)
@@ -252,7 +275,8 @@ def _fetch_endpoint_parallel(
     workers = max(1, min(max_workers, len(name_list)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(_fetch_one, endpoint, name, timeout): name for name in name_list
+            pool.submit(_fetch_one, endpoint, name, timeout, retries): name
+            for name in name_list
         }
         for future in as_completed(futures):
             result = future.result()
@@ -273,6 +297,7 @@ def check_cooldown(
     endpoints: Iterable[RegistryEndpoint] = (),
     cache_path: Path | None = None,
     max_workers: int = DEFAULT_MAX_WORKERS,
+    retries: int = DEFAULT_RETRIES,
     timeout: int = COOLDOWN_TIMEOUT_SECONDS,
     now: datetime | None = None,
 ) -> CooldownReport:
@@ -341,6 +366,12 @@ def check_cooldown(
         else:
             report.flagged.append(finding)
 
+    # Track per-name fetch errors so a later endpoint resolving the same
+    # name can wipe out the earlier transient error. The build only fails
+    # on a name that errored on at least one endpoint AND was never
+    # resolved on any other endpoint.
+    pending_errors: dict[str, str] = {}  # name → first error message seen
+
     for endpoint in endpoint_list:
         if not pending:
             break
@@ -355,6 +386,7 @@ def check_cooldown(
                 resolved_here.append((name, version))
         for nv in resolved_here:
             pending.pop(nv, None)
+            pending_errors.pop(nv[0], None)
 
         if not pending:
             break
@@ -363,7 +395,11 @@ def check_cooldown(
         names_to_fetch = sorted({name for (name, _) in pending})
         report.cache_misses += len(names_to_fetch)
         results = _fetch_endpoint_parallel(
-            endpoint, names_to_fetch, timeout=timeout, max_workers=max_workers
+            endpoint,
+            names_to_fetch,
+            timeout=timeout,
+            max_workers=max_workers,
+            retries=retries,
         )
 
         resolved_here = []
@@ -372,10 +408,12 @@ def check_cooldown(
             if result is None or result.status == "404":
                 continue  # try next endpoint
             if result.status == "error":
-                report.network_errors.append(
-                    f"{name} ({endpoint.label}): {result.error_message}"
+                # Don't fail the build yet — a later endpoint may resolve
+                # this name. Record the first error and move on.
+                pending_errors.setdefault(
+                    name, f"{name} ({endpoint.label}): {result.error_message}"
                 )
-                continue  # try next endpoint anyway
+                continue
 
             metadata = result.metadata or {}
             _cache_populate_from_metadata(cache, endpoint.label, name, metadata)
@@ -391,9 +429,16 @@ def check_cooldown(
                     resolved_here.append(nv)
         for nv in resolved_here:
             pending.pop(nv, None)
+            pending_errors.pop(nv[0], None)
 
     for name, version in pending:
         nv_label = f"{name}@{version}"
+        if name in pending_errors:
+            # Never resolved AND we hit at least one transient error.
+            # Surface as a real network_error rather than silently
+            # treating as private_blocked.
+            report.network_errors.append(pending_errors[name])
+            continue
         if name.lower() in private_allowlist:
             report.private_allowed.append(nv_label)
         else:

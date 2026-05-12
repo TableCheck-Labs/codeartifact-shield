@@ -564,6 +564,7 @@ cas audit [OPTIONS] LOCKFILE
 | `--ca-domain-owner ACCT` | CodeArtifact domain-owner AWS account ID. Optional. Env: `CAS_DOMAIN_OWNER`.                                                                                                                                                                                                |
 | `--max-workers N`        | Thread-pool size for parallel HEAD probes and OSV vuln-detail fetches. Default 20. Env: `CAS_AUDIT_MAX_WORKERS`.                                                                                                                                                            |
 | `--probe-cache PATH`     | JSON cache of probe results across CI runs. Entries never invalidate. A fully-cached audit completes in <10s on a 2500-package lockfile. Env: `CAS_AUDIT_PROBE_CACHE`.                                                                                                      |
+| `--retries N`            | How many times to retry a transient HTTP error (URLError, TimeoutError, HTTP 5xx, HTTP 429). Default 2 (3 total attempts). 429 responses honour `Retry-After` (capped at 60s). 404 and other 4xx are never retried. Shared env: `CAS_RETRIES`.                              |
 | `--json`                 | Machine-readable JSON on stdout instead of human text.                                                                                                                                                                                                                      |
 | `-h`, `--help`           | Show help.                                                                                                                                                                                                                                                                  |
 
@@ -744,6 +745,7 @@ cas cooldown [OPTIONS] LOCKFILE
 | `--ca-first`            | Query CodeArtifact first, fall back to `--registry` on 404. Default order is `--registry` first (saves token round-trip for public deps).                                                                                                                          |
 | `--cache PATH`          | JSON cache file. Publish times are immutable, so cached entries are always valid. Aggressively populated from every fetched response. Env: `CAS_COOLDOWN_CACHE`.                                                                                                  |
 | `--max-workers N`       | Thread-pool size for parallel registry fetches. Default `20`. I/O-bound, so high values are safe. Set to `1` to force serial mode for debugging. Env: `CAS_COOLDOWN_MAX_WORKERS`.                                                                                  |
+| `--retries N`           | How many times to retry a transient HTTP error (URLError, TimeoutError, HTTP 5xx, HTTP 429). Default 2 (3 total attempts). 429 responses honour `Retry-After` (capped at 60s). 404 and other 4xx are never retried. Shared env: `CAS_RETRIES`.                     |
 | `--json`                | Machine-readable JSON on stdout instead of human text.                                                                                                                                                                                                            |
 | `-h`, `--help`          | Show help.                                                                                                                                                                                                                                                        |
 
@@ -781,6 +783,24 @@ and stops failing the gate.
 > close the typosquat-of-nothing gap. If you have legitimate
 > unresolvable entries, allowlist them with `--allow-private` or point
 > cas at the right registry with `--ca-domain`.
+
+### Transient errors and resilient fallthrough (v0.7.2+)
+
+A transient HTTP failure on one endpoint must not fail the build when a
+later endpoint resolves the same name. `cas cooldown` and `cas audit`
+both track per-name outcomes across every configured endpoint:
+
+* A transient error (URLError / 5xx / 429) is **retried** in-place using
+  exponential backoff (`--retries`, default 2; honours `Retry-After`).
+* If retries are exhausted on one endpoint but a later endpoint
+  **resolves** the same `(name, version)`, the error is discarded — the
+  build passes.
+* The build only fails on a transient error when a name errored on at
+  least one endpoint **and was never resolved** on any other endpoint.
+
+This closes a gap in v0.7.1 where one flaky probe to a public registry
+would fail the build on a private package that CodeArtifact could have
+resolved.
 
 ### Performance
 
@@ -907,6 +927,7 @@ the check is consistent everywhere.
 | `CAS_DOMAIN`              | `cas sri patch`, `cas cooldown` | Default for `--domain` / `--ca-domain`.          |
 | `CAS_REPOSITORY`          | `cas sri patch`, `cas cooldown` | Default for `--repository` / `--ca-repository`.  |
 | `CAS_DOMAIN_OWNER`        | `cas cooldown`       | Default for `--ca-domain-owner`.                            |
+| `CAS_RETRIES`             | `cas audit`, `cas cooldown` | Default for `--retries`. Number of retries on transient HTTP errors (URLError, 5xx, 429). Shared. |
 | Standard `AWS_*`          | `cas sri patch`, `cas cooldown` | Picked up by boto3 for CodeArtifact auth.        |
 
 ---
