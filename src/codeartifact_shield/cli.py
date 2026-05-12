@@ -439,12 +439,14 @@ def drift_cmd(
         click.echo(
             "  These entries have no parent in the dep graph rooted at "
             "package.json. The most plausible cause is lockfile tampering "
-            "(or a partial regeneration). Re-run `npm install --package-lock-only --include=optional --force`.",
+            "(or a partial regeneration). Re-run "
+            "`npm install --package-lock-only --include=optional --force`.",
             err=True,
         )
 
     click.echo(
-        "\nFix: re-run `npm install --package-lock-only --include=optional --force` and commit the regenerated lockfile.",
+        "\nFix: re-run `npm install --package-lock-only --include=optional --force` "
+        "and commit the regenerated lockfile.",
         err=True,
     )
     sys.exit(1)

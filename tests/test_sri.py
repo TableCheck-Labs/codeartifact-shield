@@ -328,7 +328,7 @@ def test_verify_bundled_chain_breaks_when_top_lacks_integrity(tmp_path: Path) ->
     assert covered == 0
 
 
-def test_verify_inBundle_at_top_level_uncovered(tmp_path: Path) -> None:
+def test_verify_inBundle_at_top_level_uncovered(tmp_path: Path) -> None:  # noqa: N802
     """`inBundle: true` at top-level node_modules (no parent in nm) is suspicious — fail closed."""
     lockfile = _write_lock(
         tmp_path,

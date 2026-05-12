@@ -21,7 +21,7 @@ def load_lockfile(lockfile_path: Path) -> dict[str, Any]:
     Raises ``ValueError`` for unsupported versions (v1) or any structural
     anomaly that should cause cas to refuse to operate further on the file.
     """
-    lock = json.loads(lockfile_path.read_text())
+    lock: dict[str, Any] = json.loads(lockfile_path.read_text())
     lf_version = lock.get("lockfileVersion")
     if lf_version not in (2, 3):
         raise ValueError(
@@ -42,7 +42,7 @@ def _validate_package_keys(lock: dict[str, Any]) -> None:
     pkgs = lock.get("packages", {})
     if not isinstance(pkgs, dict):
         raise ValueError("`packages` must be an object in lockfileVersion 2/3")
-    for key in pkgs.keys():
+    for key in pkgs:
         if key == "":
             continue
         if not isinstance(key, str):

@@ -257,7 +257,7 @@ def _find_orphan_entries(
         "optionalDependencies",
         "peerDependencies",
     ):
-        for name in pkg.get(kind, {}).keys():
+        for name in pkg.get(kind, {}):
             queue.append(("", name))
 
     while queue:
@@ -268,7 +268,7 @@ def _find_orphan_entries(
         reachable.add(child_key)
         entry = lock_pkgs[child_key]
         for kind in ("dependencies", "peerDependencies", "optionalDependencies"):
-            for grandchild_name in entry.get(kind, {}).keys():
+            for grandchild_name in entry.get(kind, {}):
                 queue.append((child_key, grandchild_name))
         # bundleDependencies are nested by name under the parent's node_modules.
         for bundled_name in entry.get("bundleDependencies", []) or []:

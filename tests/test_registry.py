@@ -76,7 +76,9 @@ def test_multiple_allowed_hosts(tmp_path: Path) -> None:
             },
         },
     )
-    report = check_npm_registry(lf, [".d.codeartifact.us-east-1.amazonaws.com", "internal-mirror.corp"])
+    report = check_npm_registry(
+        lf, [".d.codeartifact.us-east-1.amazonaws.com", "internal-mirror.corp"]
+    )
     assert report.clean
     assert report.mixed  # two distinct hosts, both allowed
 

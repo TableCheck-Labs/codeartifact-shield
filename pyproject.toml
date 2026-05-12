@@ -1,6 +1,6 @@
 [project]
 name = "codeartifact-shield"
-version = "0.4.0"
+version = "0.4.1"
 description = "npm supply-chain hardening for AWS CodeArtifact: backfills the SRI integrity hashes CodeArtifact strips from package-lock.json, and fails the build on package.json/lockfile drift."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,16 +24,16 @@ classifiers = [
 # literal and regenerating any downstream lock.
 dependencies = [
     "boto3==1.43.6",
-    "click==8.3.0",
+    "click==8.3.3",
     "node-semver==0.9.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest==8.3.5",
-    "pytest-cov==6.0.0",
-    "ruff==0.12.2",
-    "mypy==1.18.2",
+    "pytest==9.0.3",
+    "pytest-cov==7.1.0",
+    "ruff==0.15.12",
+    "mypy==2.1.0",
     "boto3-stubs[codeartifact]==1.43.6",
 ]
 

@@ -21,7 +21,7 @@ def _write(tmp_path: Path, packages: dict[str, dict[str, object]]) -> Path:
     return p
 
 
-def test_flags_entry_with_hasInstallScript(tmp_path: Path) -> None:
+def test_flags_entry_with_hasInstallScript(tmp_path: Path) -> None:  # noqa: N802
     lf = _write(
         tmp_path,
         {
