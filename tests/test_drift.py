@@ -25,7 +25,7 @@ def test_clean_when_versions_agree(tmp_path: Path) -> None:
     root = _write_pair(
         tmp_path,
         {"dependencies": {"react": "18.3.1"}},
-        {"packages": {"node_modules/react": {"version": "18.3.1"}}},
+        {"lockfileVersion": 3, "packages": {"node_modules/react": {"version": "18.3.1"}}},
     )
     report = check_npm_drift(root, transitive=False)
     assert report.clean
@@ -36,7 +36,7 @@ def test_detects_version_disagreement(tmp_path: Path) -> None:
     root = _write_pair(
         tmp_path,
         {"dependencies": {"react": "18.3.1"}},
-        {"packages": {"node_modules/react": {"version": "18.3.2"}}},
+        {"lockfileVersion": 3, "packages": {"node_modules/react": {"version": "18.3.2"}}},
     )
     report = check_npm_drift(root, transitive=False)
     assert not report.clean
@@ -47,7 +47,7 @@ def test_detects_missing_lockfile_entry(tmp_path: Path) -> None:
     root = _write_pair(
         tmp_path,
         {"dependencies": {"react": "18.3.1"}},
-        {"packages": {}},
+        {"lockfileVersion": 3, "packages": {}},
     )
     report = check_npm_drift(root, transitive=False)
     assert report.mismatches == [("dependencies", "react", "18.3.1", "MISSING")]
@@ -61,6 +61,7 @@ def test_checks_dev_dependencies(tmp_path: Path) -> None:
             "devDependencies": {"vite": "5.0.0"},
         },
         {
+            "lockfileVersion": 3,
             "packages": {
                 "node_modules/react": {"version": "18.3.1"},
                 "node_modules/vite": {"version": "4.9.0"},
@@ -97,6 +98,7 @@ def test_ignores_transitives_when_disabled(tmp_path: Path) -> None:
         tmp_path,
         {"dependencies": {"react": "18.3.1"}},
         {
+            "lockfileVersion": 3,
             "packages": {
                 "node_modules/react": {"version": "18.3.1"},
                 "node_modules/some-transitive": {"version": "9.9.9"},
@@ -113,7 +115,7 @@ def test_ranges_mode_accepts_satisfying_resolution(tmp_path: Path) -> None:
     root = _write_pair(
         tmp_path,
         {"dependencies": {"react": "^18.3.0"}},
-        {"packages": {"node_modules/react": {"version": "18.3.1"}}},
+        {"lockfileVersion": 3, "packages": {"node_modules/react": {"version": "18.3.1"}}},
     )
     assert check_npm_drift(root, ranges=True, transitive=False).clean
 
@@ -122,7 +124,7 @@ def test_ranges_mode_rejects_out_of_range(tmp_path: Path) -> None:
     root = _write_pair(
         tmp_path,
         {"dependencies": {"react": "^18.3.0"}},
-        {"packages": {"node_modules/react": {"version": "19.0.0"}}},
+        {"lockfileVersion": 3, "packages": {"node_modules/react": {"version": "19.0.0"}}},
     )
     report = check_npm_drift(root, ranges=True, transitive=False)
     assert not report.clean
@@ -135,7 +137,7 @@ def test_strict_mode_rejects_range_declarations(tmp_path: Path) -> None:
     root = _write_pair(
         tmp_path,
         {"dependencies": {"react": "^18.3.0"}},
-        {"packages": {"node_modules/react": {"version": "18.3.1"}}},
+        {"lockfileVersion": 3, "packages": {"node_modules/react": {"version": "18.3.1"}}},
     )
     report = check_npm_drift(root, transitive=False)
     assert not report.clean
@@ -150,6 +152,7 @@ def test_transitive_clean_when_range_satisfied(tmp_path: Path) -> None:
         tmp_path,
         {"dependencies": {"react": "18.3.1"}},
         {
+            "lockfileVersion": 3,
             "packages": {
                 "node_modules/react": {
                     "version": "18.3.1",
@@ -167,6 +170,7 @@ def test_transitive_drift_when_resolved_outside_range(tmp_path: Path) -> None:
         tmp_path,
         {"dependencies": {"react": "18.3.1"}},
         {
+            "lockfileVersion": 3,
             "packages": {
                 "node_modules/react": {
                     "version": "18.3.1",
@@ -191,6 +195,7 @@ def test_transitive_resolves_nested_node_modules_first(tmp_path: Path) -> None:
         tmp_path,
         {"dependencies": {"foo": "1.0.0"}},
         {
+            "lockfileVersion": 3,
             "packages": {
                 "node_modules/foo": {
                     "version": "1.0.0",
@@ -217,6 +222,7 @@ def test_transitive_walks_intermediate_ancestor_node_modules(tmp_path: Path) -> 
         tmp_path,
         {"dependencies": {"a": "1.0.0"}},
         {
+            "lockfileVersion": 3,
             "packages": {
                 "node_modules/a": {
                     "version": "1.0.0",
@@ -245,6 +251,7 @@ def test_transitive_missing_required_dependency(tmp_path: Path) -> None:
         tmp_path,
         {"dependencies": {"foo": "1.0.0"}},
         {
+            "lockfileVersion": 3,
             "packages": {
                 "node_modules/foo": {
                     "version": "1.0.0",
@@ -264,6 +271,7 @@ def test_transitive_missing_optional_dep_is_clean(tmp_path: Path) -> None:
         tmp_path,
         {"dependencies": {"foo": "1.0.0"}},
         {
+            "lockfileVersion": 3,
             "packages": {
                 "node_modules/foo": {
                     "version": "1.0.0",
@@ -281,6 +289,7 @@ def test_transitive_non_semver_declaration_is_skipped(tmp_path: Path) -> None:
         tmp_path,
         {"dependencies": {"foo": "1.0.0"}},
         {
+            "lockfileVersion": 3,
             "packages": {
                 "node_modules/foo": {
                     "version": "1.0.0",
@@ -303,6 +312,7 @@ def test_transitive_dist_tag_declaration_is_skipped(tmp_path: Path) -> None:
         tmp_path,
         {"dependencies": {"foo": "1.0.0"}},
         {
+            "lockfileVersion": 3,
             "packages": {
                 "node_modules/foo": {
                     "version": "1.0.0",
@@ -324,6 +334,7 @@ def test_transitive_wildcard_declaration_is_clean(tmp_path: Path) -> None:
         tmp_path,
         {"dependencies": {"foo": "1.0.0"}},
         {
+            "lockfileVersion": 3,
             "packages": {
                 "node_modules/foo": {
                     "version": "1.0.0",

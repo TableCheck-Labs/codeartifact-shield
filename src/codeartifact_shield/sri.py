@@ -47,6 +47,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from codeartifact_shield._lockfile import load_lockfile
+
 logger = logging.getLogger(__name__)
 
 
@@ -258,12 +260,7 @@ def patch_lockfile(
         boto3_session = boto3.Session()
     client = boto3_session.client("codeartifact")
 
-    lock = json.loads(lockfile_path.read_text())
-    lf_version = lock.get("lockfileVersion")
-    if lf_version not in (2, 3):
-        raise ValueError(
-            f"unsupported lockfileVersion {lf_version}; only v2 and v3 are supported"
-        )
+    lock = load_lockfile(lockfile_path)
 
     report = PatchReport()
     for key, entry in _iter_lockfile_packages(lock):
@@ -318,12 +315,7 @@ def verify_lockfile(lockfile_path: Path) -> tuple[int, int]:
     Raises ``ValueError`` for unsupported lockfile versions (v1) — silently
     returning 0/0 would let a v1 lockfile pass a 100%-coverage gate.
     """
-    lock = json.loads(lockfile_path.read_text())
-    lf_version = lock.get("lockfileVersion")
-    if lf_version not in (2, 3):
-        raise ValueError(
-            f"unsupported lockfileVersion {lf_version}; only v2 and v3 are supported"
-        )
+    lock = load_lockfile(lockfile_path)
     pkgs: dict[str, dict[str, Any]] = lock.get("packages", {})
     total = 0
     covered = 0

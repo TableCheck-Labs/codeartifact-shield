@@ -30,6 +30,8 @@ from typing import Any
 
 import nodesemver
 
+from codeartifact_shield._lockfile import load_lockfile
+
 # nodesemver logs an INFO entry with a traceback for every range it can't parse
 # (e.g. ``github:org/repo#ref``, ``npm:other-name@^1.x``). We intercept the
 # parse failure ourselves and decide what to do with it; the noise just makes
@@ -160,7 +162,7 @@ def check_npm_drift(
     if not lock_path.exists():
         raise FileNotFoundError(f"no package-lock.json in {frontend_dir}")
     pkg = json.loads(pkg_path.read_text())
-    lock = json.loads(lock_path.read_text())
+    lock = load_lockfile(lock_path)
     lock_pkgs: dict[str, Any] = lock.get("packages", {})
 
     report = DriftReport()
