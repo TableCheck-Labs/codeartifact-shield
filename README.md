@@ -209,8 +209,6 @@ integrity hashes before verifying:
 * **Lockfile v2 and v3.** Older v1 lockfiles use a different structure and
   aren't supported — `sri verify` and `registry` will error out so a v1
   lockfile can't accidentally pass a 100% gate. Regenerate with Node 16+.
-* **No detection-evasion features.** All findings are surfaced; nothing is
-  silently filtered.
 * **No `.npmrc` parsing.** The lockfile is the source of truth. A project
   that wants its registry policy checked must pass the allowed hosts to the
   tool explicitly.
