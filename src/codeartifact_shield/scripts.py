@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from codeartifact_shield._lockfile import load_lockfile
+from codeartifact_shield._lockfile import extract_package_name, load_lockfile
 
 
 @dataclass
@@ -72,21 +72,6 @@ class ScriptsReport:
         return not self.flagged
 
 
-def _package_name_from_key(key: str) -> str:
-    """Extract the bare package name from a lockfile key.
-
-    ``node_modules/foo`` -> ``foo``
-    ``node_modules/@scope/name`` -> ``@scope/name``
-    ``node_modules/parent/node_modules/@scope/name`` -> ``@scope/name``
-    """
-    marker = "/node_modules/"
-    idx = key.rfind(marker)
-    tail = key[idx + len(marker) :] if idx != -1 else key
-    if tail.startswith("node_modules/"):
-        tail = tail[len("node_modules/") :]
-    return tail
-
-
 def check_install_scripts(
     lockfile_path: Path,
     allowed: Iterable[str] = (),
@@ -119,7 +104,7 @@ def check_install_scripts(
             continue
         finding = ScriptFinding(
             lockfile_key=key,
-            package_name=_package_name_from_key(key),
+            package_name=extract_package_name(key, entry),
             version=entry.get("version", ""),
         )
         if finding.package_name.lower() in allowlist:

@@ -15,6 +15,10 @@ Five commands, single responsibility each:
 * ``cas audit`` — `npm audit` equivalent that works behind CodeArtifact.
   Queries OSV.dev directly so the audit endpoint CodeArtifact doesn't
   proxy is no longer a blind spot.
+* ``cas cooldown`` — fail when any installed version was published more
+  recently than the configured threshold (default 14 days). Defends
+  against rapid-install supply-chain attacks where a malicious version
+  is live for hours before detection.
 
 Designed to be dropped into a CI step; every command exits nonzero on a
 finding, and every command supports ``--json`` for machine-readable output.
@@ -37,6 +41,14 @@ from codeartifact_shield._output import (
     severity_counts,
 )
 from codeartifact_shield.audit import SEVERITY_RANK, audit_lockfile
+from codeartifact_shield.cooldown import (
+    DEFAULT_MAX_WORKERS,
+    DEFAULT_MIN_AGE_DAYS,
+    DEFAULT_REGISTRY,
+    RegistryEndpoint,
+    build_codeartifact_endpoint,
+    check_cooldown,
+)
 from codeartifact_shield.drift import check_npm_drift
 from codeartifact_shield.pins import DEFAULT_SCOPES, check_pinning
 from codeartifact_shield.registry import check_npm_registry, host_allowed
@@ -932,6 +944,33 @@ _AUDIT_SEVERITY_TO_CAS = {
     ),
 )
 @click.option(
+    "--probe-private",
+    "probe_registry",
+    default=None,
+    envvar="CAS_AUDIT_PROBE_REGISTRY",
+    help=(
+        "Public-registry URL used to detect packages NOT covered by OSV "
+        "(typically CodeArtifact-only org-internal deps). When set, cas "
+        "GETs each unhit package against this URL; any 404 is surfaced "
+        "as HIGH `unaudited_private` (the package can't be vouched for "
+        "by OSV or by the public registry — possible typo / tampering / "
+        "internal-only). One extra HTTP request per unique package with "
+        "no OSV finding. Recommended value: `https://registry.npmjs.org`."
+    ),
+)
+@click.option(
+    "--allow-private",
+    "allow_unaudited",
+    multiple=True,
+    envvar="CAS_AUDIT_ALLOW_PRIVATE",
+    help=(
+        "Package name (including scope) permitted to be unauditable. "
+        "Repeatable. Demotes the HIGH `unaudited_private` finding to "
+        "INFO for that name. Typical use: trusted org-internal packages "
+        "you accept won't be in OSV."
+    ),
+)
+@click.option(
     "--json",
     "json_output",
     is_flag=True,
@@ -942,6 +981,8 @@ def audit_cmd(
     allowed: tuple[str, ...],
     min_severity: str | None,
     whitelist_file: Path | None,
+    probe_registry: str | None,
+    allow_unaudited: tuple[str, ...],
     json_output: bool,
 ) -> None:
     """Query OSV.dev for known vulnerabilities in every (name, version) in the lockfile."""
@@ -953,8 +994,10 @@ def audit_cmd(
         report = audit_lockfile(
             lockfile,
             allow_ids=allowed,
+            allow_unaudited=allow_unaudited,
             severity_floor=floor,
             whitelist_file=whitelist_file,
+            probe_registry=probe_registry,
         )
     except ValueError as exc:
         _emit_load_error(json_output, "audit", lockfile, exc)
@@ -999,6 +1042,22 @@ def audit_cmd(
                 "summary": f.summary,
                 "fixed_in": f.fixed_in,
                 "aliases": f.aliases,
+            }
+        )
+    for name in report.unaudited_blocked:
+        findings_payload.append(
+            {
+                "severity": Severity.HIGH.value,
+                "type": "unaudited_private",
+                "package": name,
+            }
+        )
+    for name in report.unaudited_allowed:
+        findings_payload.append(
+            {
+                "severity": Severity.INFO.value,
+                "type": "unaudited_private_allowed",
+                "package": name,
             }
         )
 
@@ -1052,3 +1111,329 @@ def audit_cmd(
         err=True,
     )
     sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# cooldown — block recently-published versions (npm minimumReleaseAge gate)
+# ---------------------------------------------------------------------------
+
+
+@main.command("cooldown")
+@click.argument("lockfile", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--min-age",
+    "min_age_days",
+    type=int,
+    default=DEFAULT_MIN_AGE_DAYS,
+    show_default=True,
+    envvar="CAS_COOLDOWN_MIN_AGE",
+    help=(
+        "Minimum age in days. Any installed version published more "
+        "recently than this is flagged. Matches StepSecurity's default."
+    ),
+)
+@click.option(
+    "--allow",
+    "allowed",
+    multiple=True,
+    envvar="CAS_COOLDOWN_ALLOW",
+    help=(
+        "Package name (including scope) permitted to ship without "
+        "a cooldown delay. Repeatable. Typical use: org-internal "
+        "packages where you control the publish."
+    ),
+)
+@click.option(
+    "--allow-private",
+    "allow_private",
+    multiple=True,
+    envvar="CAS_COOLDOWN_ALLOW_PRIVATE",
+    help=(
+        "Package name (including scope) permitted to be unresolvable on "
+        "every configured registry. Repeatable. Use sparingly — under "
+        "the secure-by-default policy, a name no registry knows is "
+        "treated as a HIGH finding (lockfile tampering / typosquat / "
+        "config gap)."
+    ),
+)
+@click.option(
+    "--registry",
+    "registry",
+    default=DEFAULT_REGISTRY,
+    show_default=True,
+    envvar="CAS_COOLDOWN_REGISTRY",
+    help=(
+        "Primary npm registry to query for publish times. Default is "
+        "`https://registry.npmjs.org`. For CodeArtifact-proxied "
+        "lockfiles, leave this on npmjs.org for public deps and pair "
+        "with `--ca-domain` for any private-only deps."
+    ),
+)
+@click.option(
+    "--ca-domain",
+    "ca_domain",
+    default=None,
+    envvar="CAS_DOMAIN",
+    help=(
+        "CodeArtifact domain. When set, cas queries the CodeArtifact "
+        "npm endpoint (with a fresh bearer token via boto3) before "
+        "falling back to `--registry`. Required for CodeArtifact-only "
+        "private packages that don't exist on public npm."
+    ),
+)
+@click.option(
+    "--ca-repository",
+    "ca_repository",
+    default=None,
+    envvar="CAS_REPOSITORY",
+    help="CodeArtifact repository name. Required when `--ca-domain` is set.",
+)
+@click.option(
+    "--ca-domain-owner",
+    "ca_domain_owner",
+    default=None,
+    envvar="CAS_DOMAIN_OWNER",
+    help=(
+        "CodeArtifact domain-owner AWS account ID. Optional — boto3 "
+        "infers it from the caller account if omitted."
+    ),
+)
+@click.option(
+    "--ca-first",
+    is_flag=True,
+    help=(
+        "When `--ca-domain` is set, query CodeArtifact FIRST and fall "
+        "back to `--registry` only on 404. Default order is "
+        "`--registry` first (saves a token round-trip for public deps)."
+    ),
+)
+@click.option(
+    "--cache",
+    "cache_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    envvar="CAS_COOLDOWN_CACHE",
+    help=(
+        "Path to a JSON cache file. Publish times are immutable, so "
+        "cached entries are always valid. Drastically speeds up "
+        "re-runs in CI when lockfile churn is small."
+    ),
+)
+@click.option(
+    "--max-workers",
+    type=int,
+    default=DEFAULT_MAX_WORKERS,
+    show_default=True,
+    envvar="CAS_COOLDOWN_MAX_WORKERS",
+    help=(
+        "Thread-pool size for parallel registry fetches. I/O-bound, so "
+        "high values are safe — 20 fits comfortably under npm's rate "
+        "limits. Lower to 1 to force serial mode for debugging."
+    ),
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Emit a machine-readable JSON report on stdout instead of human text.",
+)
+def cooldown_cmd(
+    lockfile: Path,
+    min_age_days: int,
+    allowed: tuple[str, ...],
+    allow_private: tuple[str, ...],
+    registry: str,
+    ca_domain: str | None,
+    ca_repository: str | None,
+    ca_domain_owner: str | None,
+    ca_first: bool,
+    cache_path: Path | None,
+    max_workers: int,
+    json_output: bool,
+) -> None:
+    """Fail if any installed version is younger than --min-age days."""
+    endpoints: list[RegistryEndpoint] = []
+    public = RegistryEndpoint(url=registry)
+
+    if ca_domain:
+        if not ca_repository:
+            click.echo(
+                f"{severity_badge(Severity.HIGH)} FAIL — `--ca-domain` requires `--ca-repository`",
+                err=True,
+            )
+            sys.exit(1)
+        try:
+            ca = build_codeartifact_endpoint(
+                domain=ca_domain,
+                repository=ca_repository,
+                domain_owner=ca_domain_owner,
+            )
+        except Exception as exc:  # noqa: BLE001
+            click.echo(
+                f"{severity_badge(Severity.HIGH)} FAIL — CodeArtifact auth failed: {exc}",
+                err=True,
+            )
+            sys.exit(1)
+        endpoints = [ca, public] if ca_first else [public, ca]
+    else:
+        endpoints = [public]
+
+    try:
+        report = check_cooldown(
+            lockfile,
+            min_age_days=min_age_days,
+            allowed=allowed,
+            allow_private=allow_private,
+            endpoints=endpoints,
+            cache_path=cache_path,
+            max_workers=max_workers,
+        )
+    except ValueError as exc:
+        _emit_load_error(json_output, "cooldown", lockfile, exc)
+        sys.exit(1)
+
+    findings_payload: list[dict[str, Any]] = []
+    for f in report.flagged:
+        findings_payload.append(
+            {
+                "severity": Severity.HIGH.value,
+                "type": "cooldown_too_young",
+                "package": f.package_name,
+                "version": f.version,
+                "published_at": f.published_at,
+                "age_days": f.age_days,
+                "source": f.source,
+            }
+        )
+    for f in report.allowed:
+        findings_payload.append(
+            {
+                "severity": Severity.INFO.value,
+                "type": "cooldown_too_young_allowed",
+                "package": f.package_name,
+                "version": f.version,
+                "published_at": f.published_at,
+                "age_days": f.age_days,
+                "source": f.source,
+            }
+        )
+    for entry in report.private_blocked:
+        findings_payload.append(
+            {
+                "severity": Severity.HIGH.value,
+                "type": "cooldown_private_unresolvable",
+                "package": entry,
+            }
+        )
+    for entry in report.private_allowed:
+        findings_payload.append(
+            {
+                "severity": Severity.INFO.value,
+                "type": "cooldown_private_allowed",
+                "package": entry,
+            }
+        )
+    for msg in report.network_errors:
+        findings_payload.append(
+            {
+                "severity": Severity.HIGH.value,
+                "type": "cooldown_network_error",
+                "message": msg,
+            }
+        )
+
+    if json_output:
+        emit_json(
+            {
+                "command": "cooldown",
+                "lockfile": str(lockfile),
+                "clean": report.clean,
+                "min_age_days": min_age_days,
+                "total_checked": report.total_checked,
+                "endpoints": [e.label for e in endpoints],
+                "findings": findings_payload,
+                "severity_counts": severity_counts(findings_payload),
+            }
+        )
+        if not report.clean:
+            sys.exit(1)
+        return
+
+    if report.private_allowed:
+        click.echo(
+            f"Allowlisted unresolvable packages ({len(report.private_allowed)}):"
+        )
+        for entry in report.private_allowed[:20]:
+            click.echo(f"  [OK] {entry} (allowed-private)")
+        if len(report.private_allowed) > 20:
+            click.echo(f"  ... and {len(report.private_allowed) - 20} more")
+
+    if report.private_blocked:
+        click.echo(
+            f"\nPackages not resolvable on any configured registry "
+            f"({len(report.private_blocked)}):",
+            err=True,
+        )
+        for entry in report.private_blocked[:30]:
+            click.echo(
+                f"  {severity_badge(Severity.HIGH)} {entry}  "
+                f"(no publish time on any endpoint)",
+                err=True,
+            )
+        if len(report.private_blocked) > 30:
+            click.echo(
+                f"  ... and {len(report.private_blocked) - 30} more", err=True
+            )
+        click.echo(
+            "\nLikely causes: typo in lockfile entry, lockfile tampering, "
+            "or your CodeArtifact endpoint isn't configured. To allow a "
+            "legitimate intra-workspace dep, pass `--allow-private <name>`. "
+            "To resolve private packages on CodeArtifact, pass "
+            "`--ca-domain` and `--ca-repository`.",
+            err=True,
+        )
+
+    if report.allowed:
+        click.echo(
+            f"\nAllowlisted young packages ({len(report.allowed)}):", err=True
+        )
+        for f in report.allowed:
+            click.echo(
+                f"  [OK] {f.package_name}@{f.version}  "
+                f"({f.age_days}d old, published {f.published_at})",
+                err=True,
+            )
+
+    if report.flagged:
+        click.echo(
+            f"\nVersions younger than {min_age_days} days "
+            f"({len(report.flagged)} of {report.total_checked} checked):",
+            err=True,
+        )
+        for f in report.flagged:
+            click.echo(
+                f"  {severity_badge(Severity.HIGH)} {f.package_name}@{f.version}  "
+                f"({f.age_days}d old, published {f.published_at}, source={f.source})",
+                err=True,
+            )
+
+    if report.network_errors:
+        click.echo(
+            f"\nRegistry errors ({len(report.network_errors)}):", err=True
+        )
+        for msg in report.network_errors:
+            click.echo(f"  {severity_badge(Severity.HIGH)} {msg}", err=True)
+
+    if not report.clean:
+        click.echo(
+            "\nFix: wait until the flagged versions reach the cooldown "
+            "threshold before installing them, or pin the lockfile to an "
+            "older known-good version. To allowlist (e.g. an org-internal "
+            "package), pass `--allow <name>`.",
+            err=True,
+        )
+        sys.exit(1)
+
+    click.echo(
+        f"OK — {report.total_checked} packages audited, all ≥ {min_age_days} days old."
+    )

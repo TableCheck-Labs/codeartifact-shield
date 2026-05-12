@@ -1,4 +1,4 @@
-"""Shared lockfile validation — structural sanity checks every subcommand runs.
+"""Shared lockfile helpers — structural validation and entry parsing.
 
 A tampered lockfile can carry path-traversal payloads in its package-key
 strings. cas treats those keys as opaque labels (we never filesystem-resolve
@@ -29,6 +29,31 @@ def load_lockfile(lockfile_path: Path) -> dict[str, Any]:
         )
     _validate_package_keys(lock)
     return lock
+
+
+def extract_package_name(key: str, entry: dict[str, Any] | None = None) -> str:
+    """Return the canonical npm package name for a lockfile entry.
+
+    Prefers the entry's ``name`` field, which npm sets for aliased entries
+    (e.g. ``"string-width-cjs": "npm:string-width@4.2.3"`` in package.json
+    produces ``packages["node_modules/string-width-cjs"].name == "string-width"``).
+    Falls back to the last ``node_modules/<name>`` segment of the key when
+    no ``name`` field is present (the common case for non-aliased deps).
+
+    Getting this right is load-bearing for every subcommand that queries
+    a registry by name (cooldown, audit), since the alias name doesn't
+    exist on npm and would always 404.
+    """
+    if entry is not None:
+        name = entry.get("name")
+        if isinstance(name, str) and name:
+            return name
+    marker = "/node_modules/"
+    idx = key.rfind(marker)
+    tail = key[idx + len(marker) :] if idx != -1 else key
+    if tail.startswith("node_modules/"):
+        tail = tail[len("node_modules/") :]
+    return tail
 
 
 def _validate_package_keys(lock: dict[str, Any]) -> None:

@@ -467,6 +467,119 @@ def test_audit_whitelist_file_and_allow_ids_merge(tmp_path: Path) -> None:
     assert report.clean
 
 
+# ---------------------------------------------------------------------------
+# audit --probe-private — close the silent gap for CodeArtifact-only deps
+# ---------------------------------------------------------------------------
+
+
+def test_audit_probe_private_flags_packages_missing_from_public_npm(
+    tmp_path: Path,
+) -> None:
+    lf = _write_lock(
+        tmp_path,
+        {
+            "node_modules/lodash": {"version": "4.17.21"},
+            "node_modules/@my/internal-only": {"version": "1.0.0"},
+        },
+    )
+
+    def mock_batch(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        # Neither package has OSV findings (lodash@4.17.21 is the latest
+        # patched version; @my/internal-only is private).
+        return {"results": [{}, {}]}
+
+    def mock_get(url: str, timeout: int) -> dict[str, Any]:
+        # Public npm registry: lodash exists, internal-only is 404.
+        if url.endswith("/lodash"):
+            return {"name": "lodash"}
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_batch), patch(
+        "codeartifact_shield.audit._http_get_json", mock_get
+    ):
+        report = audit_lockfile(
+            lf, probe_registry="https://registry.npmjs.org"
+        )
+    # Secure-by-default: package not in OSV AND not on public npm → HIGH.
+    assert "@my/internal-only" in report.unaudited_blocked
+    assert "@my/internal-only" not in report.unaudited_allowed
+    assert "lodash" not in report.unaudited_blocked
+    assert not report.clean
+
+
+def test_audit_probe_private_default_off_no_extra_requests(tmp_path: Path) -> None:
+    lf = _write_lock(tmp_path, {"node_modules/lodash": {"version": "4.17.21"}})
+    get_calls: list[str] = []
+
+    def mock_batch(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        return {"results": [{}]}
+
+    def mock_get(url: str, timeout: int) -> dict[str, Any]:
+        get_calls.append(url)
+        return {}
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_batch), patch(
+        "codeartifact_shield.audit._http_get_json", mock_get
+    ):
+        report = audit_lockfile(lf)  # probe_registry=None
+    assert get_calls == []  # no probes by default
+    assert report.unaudited_blocked == []
+    assert report.unaudited_allowed == []
+
+
+def test_audit_uses_name_field_for_npm_aliases(tmp_path: Path) -> None:
+    # Aliased entry: key is `node_modules/string-width-cjs` but the
+    # canonical npm name (in `name`) is `string-width`. cas must query
+    # OSV with the canonical name, not the alias, or it silently misses
+    # vulns (OSV doesn't index alias names).
+    lf = _write_lock(
+        tmp_path,
+        {
+            "node_modules/string-width-cjs": {
+                "name": "string-width",
+                "version": "4.2.3",
+            },
+        },
+    )
+    queried_names: list[str] = []
+
+    def mock_batch(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        queried_names.extend([q["package"]["name"] for q in body["queries"]])
+        return {"results": [{}]}
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_batch):
+        audit_lockfile(lf)
+    assert queried_names == ["string-width"]  # NOT "string-width-cjs"
+
+
+def test_audit_allow_private_demotes_unaudited_to_info(tmp_path: Path) -> None:
+    lf = _write_lock(
+        tmp_path,
+        {
+            "node_modules/@org/typo": {"version": "1.0.0"},
+            "node_modules/@org/legit-internal": {"version": "1.0.0"},
+        },
+    )
+
+    def mock_batch(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        return {"results": [{}, {}]}
+
+    def mock_get(url: str, timeout: int) -> dict[str, Any]:
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_batch), patch(
+        "codeartifact_shield.audit._http_get_json", mock_get
+    ):
+        report = audit_lockfile(
+            lf,
+            probe_registry="https://registry.npmjs.org",
+            allow_unaudited=["@org/legit-internal"],
+        )
+    assert "@org/legit-internal" in report.unaudited_allowed
+    assert "@org/typo" in report.unaudited_blocked
+    assert not report.clean
+
+
 def test_audit_real_auditjs_fixture_loads(tmp_path: Path) -> None:
     # Sanity check that load_whitelist_file accepts the actual production
     # auditjs.json shape (captured as a fixture).

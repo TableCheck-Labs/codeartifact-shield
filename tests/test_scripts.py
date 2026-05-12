@@ -21,6 +21,26 @@ def _write(tmp_path: Path, packages: dict[str, dict[str, object]]) -> Path:
     return p
 
 
+def test_scripts_uses_name_field_for_npm_aliases(tmp_path: Path) -> None:
+    # Aliased lockfile entry: key is `node_modules/string-width-cjs` but
+    # the canonical npm name (in the `name` field) is `string-width`.
+    # The finding must surface the canonical name so allowlist matches.
+    lf = _write(
+        tmp_path,
+        {
+            "node_modules/string-width-cjs": {
+                "name": "string-width",
+                "version": "4.2.3",
+                "hasInstallScript": True,
+            },
+        },
+    )
+    report = check_install_scripts(lf, allowed=["string-width"])
+    assert report.clean
+    assert len(report.allowed) == 1
+    assert report.allowed[0].package_name == "string-width"
+
+
 def test_flags_entry_with_hasInstallScript(tmp_path: Path) -> None:  # noqa: N802
     lf = _write(
         tmp_path,

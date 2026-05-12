@@ -23,6 +23,11 @@ cas pin         fail when any direct package.json declaration is a
 cas audit       npm-audit equivalent that works behind CodeArtifact —
                 queries OSV.dev directly so the audit endpoint
                 CodeArtifact doesn't proxy is no longer a blind spot
+cas cooldown    fail when any installed version is younger than
+                --min-age days (default 14). Defends against rapid-
+                install attacks where a malicious version is live
+                before any scanner has seen it. Works on npm, on
+                CodeArtifact, and on mixed setups.
 ```
 
 Every command:
@@ -549,11 +554,37 @@ cas audit [OPTIONS] LOCKFILE
 
 | Flag                | Behavior                                                                                                                                                                                                                                                                  |
 | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--allow TEXT`      | Vuln ID (`GHSA-...`, `CVE-...`, `OSV-...`) to suppress. Repeatable. Matched case-insensitively against the primary id **and** each alias. Env: `CAS_AUDIT_ALLOW` (whitespace-separated).                                                                              |
-| `--min-severity SEV`| Only report findings at or above this severity. Choices: `critical`, `high`, `medium`/`moderate`, `low`. Default: report all (matches `npm audit` default).                                                                                                              |
-| `--whitelist FILE`  | Path to a whitelist file. Two formats accepted (see below). Env: `CAS_AUDIT_WHITELIST`. IDs from the file are merged with `--allow` flags.                                                                                                                                |
-| `--json`            | Machine-readable JSON on stdout instead of human text.                                                                                                                                                                                                                    |
-| `-h`, `--help`      | Show help.                                                                                                                                                                                                                                                                |
+| `--allow TEXT`         | Vuln ID (`GHSA-...`, `CVE-...`, `OSV-...`) to suppress. Repeatable. Matched case-insensitively against the primary id **and** each alias. Env: `CAS_AUDIT_ALLOW`.                                                                                                          |
+| `--allow-private TEXT` | Package name (with scope) permitted to be unauditable. Demotes `unaudited_private` HIGH → INFO for that name. Only meaningful with `--probe-private`. Repeatable. Env: `CAS_AUDIT_ALLOW_PRIVATE`.                                                                          |
+| `--min-severity SEV`   | Only report findings at or above this severity. Choices: `critical`, `high`, `medium`/`moderate`, `low`. Default: report all.                                                                                                                                              |
+| `--whitelist FILE`     | Path to a whitelist file. Two formats accepted (see below). Env: `CAS_AUDIT_WHITELIST`. IDs from the file are merged with `--allow` flags.                                                                                                                                  |
+| `--probe-private URL`  | Public-registry URL to detect packages not covered by OSV. Each unhit package gets one extra `GET <url>/<name>`; any 404 is surfaced as `unaudited_private` (HIGH by default — see "Secure by default" below). Recommended: `https://registry.npmjs.org`. Env: `CAS_AUDIT_PROBE_REGISTRY`. |
+| `--json`               | Machine-readable JSON on stdout instead of human text.                                                                                                                                                                                                                      |
+| `-h`, `--help`         | Show help.                                                                                                                                                                                                                                                                  |
+
+### Secure by default — unaudited private packages
+
+OSV.dev indexes public-ecosystem advisories only. A package OSV
+returns no findings for could mean "audited, clean" OR "OSV doesn't
+know this package" — indistinguishable from the OSV response alone.
+CodeArtifact-only private packages always fall into the second bucket.
+
+`--probe-private <url>` closes that gap: cas GETs each unhit package
+against a public registry. If the registry also 404s, cas surfaces
+the package as **`[HIGH] unaudited_private`** and fails the build.
+The package is either a typo, lockfile tampering, or a real internal
+package you must explicitly accept as out-of-scope for OSV.
+
+Use `--allow-private <name>` to demote trusted org-internal packages
+to INFO. Combined recipe for a CodeArtifact-proxied project:
+
+```bash
+cas audit ./package-lock.json \
+  --whitelist ./auditjs.json \
+  --probe-private https://registry.npmjs.org \
+  --allow-private @my-org/internal-cli \
+  --allow-private @my-org/shared-lib
+```
 
 ### Whitelist file formats
 
@@ -660,6 +691,153 @@ type `audit_network_error` and exits `1` — never silently returns
 
 ---
 
+## `cas cooldown`
+
+Fail when any installed package version was published more recently
+than the configured threshold (default **14 days**). Defends against
+rapid-install supply-chain attacks where a malicious version is live
+on the registry for hours-to-days before any scanner sees it. Inspired
+by StepSecurity's npm-package-cooldown-check, kevinslin/safe-npm, and
+pnpm's `minimumReleaseAge` setting.
+
+```
+cas cooldown [OPTIONS] LOCKFILE
+```
+
+| Flag                    | Behavior                                                                                                                                                                                                                                                          |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--min-age DAYS`        | Minimum age in days. Versions younger than this fail the gate. Default `14`. Env: `CAS_COOLDOWN_MIN_AGE`.                                                                                                                                                          |
+| `--allow TEXT`          | Package name (including scope) permitted to ship without a cooldown delay. Repeatable. Env: `CAS_COOLDOWN_ALLOW`.                                                                                                                                                  |
+| `--allow-private TEXT`  | Package name permitted to be unresolvable on every configured registry (see "Secure by default" below). Repeatable. Env: `CAS_COOLDOWN_ALLOW_PRIVATE`.                                                                                                            |
+| `--registry URL`        | Primary registry to query for publish times. Default `https://registry.npmjs.org`. Env: `CAS_COOLDOWN_REGISTRY`.                                                                                                                                                   |
+| `--ca-domain DOMAIN`    | CodeArtifact domain. When set, cas queries the CA npm endpoint with a fresh bearer token (boto3). Required for CodeArtifact-only private packages. Env: `CAS_DOMAIN`.                                                                                              |
+| `--ca-repository REPO`  | CodeArtifact repository name. Required when `--ca-domain` is set. Env: `CAS_REPOSITORY`.                                                                                                                                                                          |
+| `--ca-domain-owner ACCT`| CodeArtifact domain-owner AWS account ID. Optional — boto3 infers from caller. Env: `CAS_DOMAIN_OWNER`.                                                                                                                                                            |
+| `--ca-first`            | Query CodeArtifact first, fall back to `--registry` on 404. Default order is `--registry` first (saves token round-trip for public deps).                                                                                                                          |
+| `--cache PATH`          | JSON cache file. Publish times are immutable, so cached entries are always valid. Aggressively populated from every fetched response. Env: `CAS_COOLDOWN_CACHE`.                                                                                                  |
+| `--max-workers N`       | Thread-pool size for parallel registry fetches. Default `20`. I/O-bound, so high values are safe. Set to `1` to force serial mode for debugging. Env: `CAS_COOLDOWN_MAX_WORKERS`.                                                                                  |
+| `--json`                | Machine-readable JSON on stdout instead of human text.                                                                                                                                                                                                            |
+| `-h`, `--help`          | Show help.                                                                                                                                                                                                                                                        |
+
+### Three deployment scenarios
+
+| Setup                              | Recommended flags                                                                                                |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Public npm only                    | `--cache .cas-cooldown-cache.json` (defaults to `registry.npmjs.org`)                                            |
+| CodeArtifact-proxied + public npm  | `--ca-domain <d> --ca-repository <r> --cache .cas-cooldown-cache.json` — public deps hit npm first, private deps fall back to CA on 404 |
+| CodeArtifact-only (private)        | `--ca-domain <d> --ca-repository <r> --ca-first --cache .cas-cooldown-cache.json`                                |
+
+For each `(name, version)`, cas tries endpoints in order. A miss is
+either an HTTP 404 OR a 200 response whose `time` dict doesn't contain
+the specific version. Both fall through to the next endpoint. This
+matters: public npm sometimes returns a placeholder metadata response
+for org scopes without serving the private versions.
+
+### Secure by default — what happens to unresolvable names
+
+If a `(name, version)` cannot be resolved on **any** configured
+endpoint, cas surfaces it as a **`[HIGH] cooldown_private_unresolvable`**
+finding and fails the build. This catches:
+
+* Typo'd dependency names that don't exist anywhere (`lodahs` for `lodash`).
+* Lockfile tampering inserting a bogus entry.
+* Configuration gaps — a real private package whose CA endpoint cas wasn't told about.
+
+To allow a legitimate case (e.g. an intra-workspace dep that npm wrote
+into the lockfile but lives only in the repo), pass
+`--allow-private <name>`. The entry becomes `[INFO] cooldown_private_allowed`
+and stops failing the gate.
+
+> **Migration note (v0.7+):** earlier versions (≤0.6) treated
+> unresolvable packages as silent INFO. v0.7 promotes them to HIGH to
+> close the typosquat-of-nothing gap. If you have legitimate
+> unresolvable entries, allowlist them with `--allow-private` or point
+> cas at the right registry with `--ca-domain`.
+
+### Performance
+
+cas cooldown parallelises registry fetches via `ThreadPoolExecutor`
+(`--max-workers` default 20). On a 2500-package lockfile, expect:
+
+| Mode                          | Wall time       |
+| ----------------------------- | --------------- |
+| First run, parallel, no cache | ~15–20 seconds  |
+| First run, serial (`--max-workers 1`) | ~3–5 minutes |
+| Cached run (lockfile unchanged) | <1 second     |
+
+### Examples
+
+```bash
+# Default: query public npm, parallel, no cache. Strict by default.
+cas cooldown ./package-lock.json
+
+# Recommended CI config (CA + npm, persistent cache):
+cas cooldown ./package-lock.json \
+  --ca-domain my-domain --ca-repository my-repo \
+  --cache .cas-cooldown-cache.json
+
+# Allow a workspace-internal dep to be unresolvable:
+cas cooldown ./package-lock.json --allow-private @org/internal-dev-tool
+
+# Raise the bar for security-critical projects:
+cas cooldown ./package-lock.json --min-age 30
+
+# Debug mode (serial, no cache, JSON):
+cas cooldown ./package-lock.json --max-workers 1 --json | jq .
+```
+
+### JSON schema
+
+```json
+{
+  "command": "cooldown",
+  "lockfile": "/path/to/package-lock.json",
+  "clean": false,
+  "min_age_days": 14,
+  "total_checked": 2521,
+  "endpoints": ["registry.npmjs.org", "my-ca.d.codeartifact.us-east-1.amazonaws.com"],
+  "findings": [
+    {
+      "severity": "HIGH",
+      "type": "cooldown_too_young",
+      "package": "fast-uri",
+      "version": "3.1.2",
+      "published_at": "2026-05-05T08:31:31.849Z",
+      "age_days": 7.09,
+      "source": "registry.npmjs.org"
+    },
+    {
+      "severity": "HIGH",
+      "type": "cooldown_private_unresolvable",
+      "package": "lodahs@1.0.0"
+    }
+  ],
+  "severity_counts": {"CRITICAL": 0, "HIGH": 2, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+}
+```
+
+### Cache file format
+
+```json
+{
+  "schema_version": 1,
+  "entries": {
+    "registry.npmjs.org": {
+      "lodash": {
+        "4.17.21": "2021-02-21T02:46:48.218Z",
+        "4.17.20": "2020-07-09T18:46:44.196Z"
+      }
+    }
+  }
+}
+```
+
+Cached entries are never invalidated (publish times are immutable). A
+corrupt cache file is silently treated as empty and re-written on the
+next run.
+
+---
+
 ## Lockfile structure validation
 
 Every command refuses to operate on a structurally-suspect lockfile
@@ -689,7 +867,18 @@ the check is consistent everywhere.
 | `CAS_ALLOWED_UNPINNED`    | `cas pin`            | Whitespace-separated default for `--allow`.                 |
 | `CAS_AUDIT_ALLOW`         | `cas audit`          | Whitespace-separated default for `--allow`.                 |
 | `CAS_AUDIT_WHITELIST`     | `cas audit`          | Default path for `--whitelist`.                             |
-| Standard `AWS_*`          | `cas sri patch`      | Picked up by boto3 for CodeArtifact API auth.               |
+| `CAS_AUDIT_PROBE_REGISTRY`| `cas audit`          | Default for `--probe-private`.                              |
+| `CAS_AUDIT_ALLOW_PRIVATE` | `cas audit`          | Whitespace-separated default for `--allow-private`.         |
+| `CAS_COOLDOWN_MIN_AGE`    | `cas cooldown`       | Default for `--min-age`.                                    |
+| `CAS_COOLDOWN_ALLOW`      | `cas cooldown`       | Whitespace-separated default for `--allow`.                 |
+| `CAS_COOLDOWN_ALLOW_PRIVATE` | `cas cooldown`    | Whitespace-separated default for `--allow-private`.         |
+| `CAS_COOLDOWN_REGISTRY`   | `cas cooldown`       | Default for `--registry`.                                   |
+| `CAS_COOLDOWN_CACHE`      | `cas cooldown`       | Default path for `--cache`.                                 |
+| `CAS_COOLDOWN_MAX_WORKERS`| `cas cooldown`       | Default for `--max-workers`.                                |
+| `CAS_DOMAIN`              | `cas sri patch`, `cas cooldown` | Default for `--domain` / `--ca-domain`.          |
+| `CAS_REPOSITORY`          | `cas sri patch`, `cas cooldown` | Default for `--repository` / `--ca-repository`.  |
+| `CAS_DOMAIN_OWNER`        | `cas cooldown`       | Default for `--ca-domain-owner`.                            |
+| Standard `AWS_*`          | `cas sri patch`, `cas cooldown` | Picked up by boto3 for CodeArtifact auth.        |
 
 ---
 
@@ -731,7 +920,19 @@ A complete gate looks like this (Semaphore CI):
         commands:
           - source ./.semaphore/commands/install-cas.sh
           - cas audit ./package-lock.json --whitelist ./auditjs.json --min-severity high
+      - name: Cooldown
+        commands:
+          - source ./.semaphore/commands/install-cas.sh
+          - >-
+            cas cooldown ./package-lock.json
+            --min-age 14
+            --ca-domain my-domain --ca-repository my-repo
+            --cache .cas-cooldown-cache.json
 ```
+
+Cache the `.cas-cooldown-cache.json` file across CI runs (Semaphore
+`cache store`, GitHub Actions `actions/cache`, etc.) — subsequent runs
+on an unchanged lockfile complete in well under a second.
 
 `install-cas.sh` should pin cas by **literal SHA**, not via a
 `${CAS_REF:-…}` fallback that lets a hostile env var redirect pip. Example:
@@ -762,7 +963,8 @@ actual=$(cas --version | awk '{print $NF}')
 | `registry`    | every entry on an allowed host       | leaks detected (or `--fail-on-git` with any git-sourced) or load error    | —                                                         |
 | `scripts`     | every script-runner is allowlisted   | unallowlisted script-running entry found or load error                    | —                                                         |
 | `pin`         | every checked direct dep is pinned   | unpinned direct dep found, or `package.json` missing                      | —                                                         |
-| `audit`       | no vulnerabilities at or above `--min-severity` | vulnerability found, network error reaching OSV.dev, or load error | —                                                         |
+| `audit`       | no vulnerabilities at or above `--min-severity`, no unaudited-private blocked | vuln/unaudited-private found, network error reaching OSV.dev/probe-registry, or load error | —                                                         |
+| `cooldown`    | every (name, version) ≥ `--min-age` and resolvable on a configured registry | version younger than threshold, name unresolvable on all endpoints, network error, or load error | —                                                         |
 
 ---
 

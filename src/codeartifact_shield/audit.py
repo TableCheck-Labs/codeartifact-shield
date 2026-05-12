@@ -16,13 +16,14 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from codeartifact_shield._lockfile import load_lockfile
+from codeartifact_shield._lockfile import extract_package_name, load_lockfile
 
 OSV_BATCH_ENDPOINT = "https://api.osv.dev/v1/querybatch"
 OSV_VULN_ENDPOINT = "https://api.osv.dev/v1/vulns"
@@ -50,19 +51,25 @@ class AuditReport:
     findings: list[AuditFinding] = field(default_factory=list)
     total_checked: int = 0
     network_error: str | None = None
+    unaudited_blocked: list[str] = field(default_factory=list)
+    """Package names not on the configured public registry AND not covered
+    by OSV. HIGH-severity under the secure-by-default policy: a name no
+    public source can verify is either a typo, lockfile tampering, or an
+    internal package the user must explicitly trust via ``allow_unaudited``.
+
+    Populated only when ``probe_registry`` is supplied."""
+
+    unaudited_allowed: list[str] = field(default_factory=list)
+    """Same condition as ``unaudited_blocked`` but explicitly allowlisted.
+    INFO-severity; doesn't fail the gate."""
 
     @property
     def clean(self) -> bool:
-        return not self.findings and self.network_error is None
-
-
-def _package_name_from_key(key: str) -> str:
-    marker = "/node_modules/"
-    idx = key.rfind(marker)
-    tail = key[idx + len(marker) :] if idx != -1 else key
-    if tail.startswith("node_modules/"):
-        tail = tail[len("node_modules/") :]
-    return tail
+        return (
+            not self.findings
+            and not self.unaudited_blocked
+            and self.network_error is None
+        )
 
 
 def _http_post_json(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
@@ -164,10 +171,12 @@ def load_whitelist_file(path: Path) -> list[str]:
 def audit_lockfile(
     lockfile_path: Path,
     allow_ids: Iterable[str] = (),
+    allow_unaudited: Iterable[str] = (),
     severity_floor: str | None = None,
     whitelist_file: Path | None = None,
     batch_endpoint: str = OSV_BATCH_ENDPOINT,
     vuln_endpoint: str = OSV_VULN_ENDPOINT,
+    probe_registry: str | None = None,
     timeout: int = OSV_TIMEOUT_SECONDS,
 ) -> AuditReport:
     """Audit every (name, version) pair in the lockfile against OSV.dev.
@@ -193,7 +202,7 @@ def audit_lockfile(
             continue
         if entry.get("link"):
             continue
-        name = _package_name_from_key(key)
+        name = extract_package_name(key, entry)
         version = entry.get("version")
         if not name or not isinstance(version, str):
             continue
@@ -239,6 +248,48 @@ def audit_lockfile(
     if whitelist_file is not None:
         combined_allow.extend(load_whitelist_file(whitelist_file))
     allowlist = {x.upper() for x in combined_allow}
+
+    name_had_findings: dict[str, bool] = {}
+    for (name, _version), ids in zip(pkg_list, all_results, strict=True):
+        name_had_findings[name] = name_had_findings.get(name, False) or bool(ids)
+
+    if probe_registry is not None:
+        base = probe_registry.rstrip("/")
+        unaudited_private_list: list[str] = []
+        unique_names = sorted({name for (name, _) in pkg_list})
+        for name in unique_names:
+            if name_had_findings.get(name):
+                continue
+            probe_url = (
+                f"{base}/{urllib.parse.quote(name, safe='@')}"
+            )
+            try:
+                _http_get_json(probe_url, timeout=timeout)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    unaudited_private_list.append(name)
+                else:
+                    report.network_error = (
+                        f"Private-package probe failed for {name}: HTTP {exc.code}"
+                    )
+                    return report
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+                json.JSONDecodeError,
+            ) as exc:
+                report.network_error = (
+                    f"Private-package probe failed for {name}: {exc}"
+                )
+                return report
+
+        unaudited_allowlist = {n.lower() for n in allow_unaudited}
+        for name in unaudited_private_list:
+            if name.lower() in unaudited_allowlist:
+                report.unaudited_allowed.append(name)
+            else:
+                report.unaudited_blocked.append(name)
 
     for i, ids in enumerate(all_results):
         if not ids:
