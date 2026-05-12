@@ -3,11 +3,45 @@
 npm supply-chain hardening for projects that proxy through **AWS CodeArtifact**.
 
 ```
-cas drift       fail on package.json / package-lock.json disagreement (direct + transitive)
+cas drift       fail on package.json / package-lock.json disagreement (direct + transitive + orphans)
 cas sri patch   backfill the SRI integrity hashes CodeArtifact strips from npm metadata
-cas sri verify  fail when SRI coverage drops below threshold
-cas registry    fail when the lockfile resolves packages from a non-allowed host
+cas sri verify  fail when SRI coverage drops below threshold (sha256+ required; sha1 rejected)
+cas registry    fail when the lockfile resolves packages from a non-allowed host (label-anchored)
+cas scripts     fail when any lockfile entry will execute lifecycle scripts at install time
 ```
+
+## What changed in v0.2.0
+
+Security-driven changes; **some are breaking**. Review before upgrading.
+
+- **`cas registry` is label-anchored, not substring.** A pattern like
+  `.d.codeartifact.` used to substring-match anything containing those
+  characters — including attacker-controlled hosts of the form
+  `evil.d.codeartifact.attacker.com`. Patterns now match at hostname-label
+  boundaries: a host must *equal* the pattern or *end with* `.` + the pattern.
+  Update existing config from `.d.codeartifact.` to the full suffix
+  `.d.codeartifact.<region>.amazonaws.com`.
+- **`cas registry` requires HTTPS.** A `resolved` URL using `http://`,
+  `ftp://`, or any non-https scheme is treated as leaked, even if the host
+  is in the allowlist.
+- **`cas sri verify` rejects sha1 integrity.** SHA-1 is collision-broken and
+  was removed from the modern SRI spec. Lockfile entries whose only integrity
+  is `sha1-…` count as missing; `cas sri patch` overwrites them with sha512
+  from CodeArtifact.
+- **`cas sri verify` correctly handles `bundleDependencies`.** Bundled
+  entries are now counted in the denominator AND credited to their parent's
+  integrity hash. A 100% threshold is again honestly reachable; an
+  orphan-bundled entry (parent has no integrity) fails closed.
+- **`cas drift` detects orphan lockfile entries** that no `package.json`
+  (root or transitive) declares — the most plausible footprint of a
+  malicious lockfile insertion.
+- **`cas scripts` is new.** Fails the build on any lockfile entry whose
+  `hasInstallScript: true` (i.e., will run `preinstall`/`install`/
+  `postinstall` at `npm install` time). Allowlist the build-essentials
+  you need via `--allow <package>`.
+- **Lockfile path-traversal validation.** Every subcommand refuses to
+  operate on a lockfile whose package keys contain `..`, leading `/`,
+  null bytes, or other malformed path segments.
 
 ## Why this exists
 
@@ -126,26 +160,63 @@ cas sri verify ./frontend/package-lock.json --min-coverage 100
 ### `cas registry`
 
 Walks every `resolved` URL in the lockfile and fails when any host doesn't
-match one of the `--allowed-host` substring patterns. Reads the lockfile
-only — never `.npmrc` or machine-level npm config — because the lockfile is
-what `npm ci` obeys at install time. The project must declare its allowed
-registry hosts to the checker explicitly.
+match one of the `--allowed-host` patterns or when any URL uses a non-HTTPS
+scheme. Reads the lockfile only — never `.npmrc` or machine-level npm
+config — because the lockfile is what `npm ci` obeys at install time. The
+project must declare its allowed registry hosts to the checker explicitly.
+
+`--allowed-host` is **label-anchored**: the host must equal the pattern or
+end with `.` + the pattern. Substring matching is intentionally not
+supported because it lets attacker-controlled hosts like
+`evil.d.codeartifact.attacker.com` pass an allowlist of `.d.codeartifact.`.
 
 ```bash
-# Single allowed host:
+# Single allowed host (note the FULL suffix — region + amazonaws.com):
 cas registry ./frontend/package-lock.json \
-  --allowed-host '.d.codeartifact.'
+  --allowed-host '.d.codeartifact.ap-northeast-1.amazonaws.com'
 
 # Multiple (CodeArtifact + a corporate mirror):
 cas registry ./frontend/package-lock.json \
-  --allowed-host '.d.codeartifact.' \
+  --allowed-host '.d.codeartifact.ap-northeast-1.amazonaws.com' \
   --allowed-host 'mirror.corp.example'
 
 # Also fail on git-sourced deps (they bypass any registry contract):
 cas registry ./frontend/package-lock.json \
-  --allowed-host '.d.codeartifact.' \
+  --allowed-host '.d.codeartifact.ap-northeast-1.amazonaws.com' \
   --fail-on-git
 ```
+
+`http://` and other non-HTTPS schemes are always rejected, regardless of host.
+
+### `cas scripts`
+
+Lifecycle-script audit. Fails the build on any lockfile entry whose
+`hasInstallScript: true` — meaning npm will execute that package's
+`preinstall`, `install`, or `postinstall` hook at `npm install` time.
+This is the highest-blast-radius unhandled vector in the npm ecosystem:
+SRI binds bytes to hashes but doesn't prevent a maintainer from
+deliberately shipping a malicious lifecycle hook.
+
+```bash
+# Fail on any unaudited script-runner:
+cas scripts ./frontend/package-lock.json
+
+# Allowlist the build-essentials that legitimately need to compile
+# platform binaries at install time:
+cas scripts ./frontend/package-lock.json \
+  --allow esbuild \
+  --allow fsevents \
+  --allow @parcel/watcher
+```
+
+Allowlist entries are matched by full package name (including scope).
+`watcher` does NOT match `@parcel/watcher` — preventing typo-squat
+substitution attacks against the allowlist itself.
+
+To eliminate lifecycle scripts entirely, install with
+`npm ci --ignore-scripts` and find replacements for any script-running deps.
+
+### Registry classification
 
 Classifies each entry into one of:
 * **Allowed host** — counted in the per-host distribution.
@@ -169,14 +240,17 @@ A complete gate looks like:
 - name: Install codeartifact-shield
   run: pip install "git+https://github.com/alexandernicholson/codeartifact-shield.git"
 
-- name: Drift check
+- name: Drift + orphan check
   run: cas drift ./frontend
 
 - name: Integrity coverage
   run: cas sri verify ./frontend/package-lock.json --min-coverage 100
 
 - name: Registry-leakage check
-  run: cas registry ./frontend/package-lock.json --allowed-host '.d.codeartifact.'
+  run: cas registry ./frontend/package-lock.json --allowed-host '.d.codeartifact.ap-northeast-1.amazonaws.com'
+
+- name: Lifecycle-script audit
+  run: cas scripts ./frontend/package-lock.json --allow esbuild --allow fsevents
 ```
 
 If you regenerate the lockfile in CI (e.g. after `npm install`), patch
