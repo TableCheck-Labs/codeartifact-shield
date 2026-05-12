@@ -1,11 +1,13 @@
 """CLI surface — ``cas`` (alias for ``codeartifact-shield``).
 
-Two commands, single responsibility each:
+Three commands, single responsibility each:
 
 * ``cas sri patch`` / ``cas sri verify`` — close the SRI-integrity gap
   that AWS CodeArtifact's npm proxy leaves in ``package-lock.json``.
 * ``cas drift`` — fail if ``package.json`` and ``package-lock.json``
   disagree on direct-dep versions.
+* ``cas registry`` — fail if any lockfile entry was resolved from a host
+  other than the configured CodeArtifact / mirror.
 
 Designed to be dropped into a CI step; every command exits nonzero
 on a finding.
@@ -21,6 +23,7 @@ import click
 
 from codeartifact_shield import __version__
 from codeartifact_shield.drift import check_npm_drift
+from codeartifact_shield.registry import check_npm_registry
 from codeartifact_shield.sri import patch_lockfile, verify_lockfile
 
 logger = logging.getLogger(__name__)
@@ -160,3 +163,74 @@ def drift_cmd(frontend_dir: Path) -> None:
         err=True,
     )
     sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# registry — registry-leakage detection (CodeArtifact vs public npm vs mixed)
+# ---------------------------------------------------------------------------
+
+
+@main.command("registry")
+@click.argument("lockfile", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--allowed-host",
+    "allowed_hosts",
+    multiple=True,
+    required=True,
+    envvar="CAS_ALLOWED_HOSTS",
+    help=(
+        "Substring (case-insensitive) that an entry's resolved host must contain "
+        "to be considered legitimate. Repeatable. e.g. "
+        "`--allowed-host .d.codeartifact.`."
+    ),
+)
+@click.option(
+    "--fail-on-git",
+    is_flag=True,
+    help="Also fail if any entry was resolved directly from git (bypasses the registry).",
+)
+def registry_cmd(
+    lockfile: Path,
+    allowed_hosts: tuple[str, ...],
+    fail_on_git: bool,
+) -> None:
+    """Fail the build if the lockfile resolves any package from a non-allowed host.
+
+    Catches *registry leakage*: a project meant to install through
+    CodeArtifact that has quietly started pulling tarballs from
+    ``registry.npmjs.org`` (or anywhere else) for one or more entries.
+
+    Reads the lockfile only — never ``.npmrc`` or machine-level npm config —
+    because the lockfile is what ``npm ci`` actually obeys at install time.
+    """
+    try:
+        report = check_npm_registry(lockfile, allowed_hosts)
+    except ValueError as exc:
+        click.echo(f"FAIL — {exc}", err=True)
+        sys.exit(1)
+
+    click.echo("Resolved-host distribution:")
+    for host, count in sorted(report.by_host.items(), key=lambda kv: -kv[1]):
+        marker = "OK" if any(p.lower() in host.lower() for p in allowed_hosts) else "LEAK"
+        click.echo(f"  [{marker}] {host}: {count}")
+    if report.mixed:
+        click.echo("WARN — mixed registries: lockfile resolves from more than one host.")
+
+    if report.leaked:
+        click.echo(f"\nLeaked entries ({len(report.leaked)}):", err=True)
+        for k, host in report.leaked[:30]:
+            click.echo(f"  {k}  <-  {host}", err=True)
+        if len(report.leaked) > 30:
+            click.echo(f"  ... and {len(report.leaked) - 30} more", err=True)
+
+    if report.git_sourced:
+        label = "Git-sourced entries (bypass registry)"
+        stream_err = fail_on_git
+        click.echo(f"\n{label} ({len(report.git_sourced)}):", err=stream_err)
+        for k, ref in report.git_sourced[:10]:
+            click.echo(f"  {k}  <-  {ref}", err=stream_err)
+        if len(report.git_sourced) > 10:
+            click.echo(f"  ... and {len(report.git_sourced) - 10} more", err=stream_err)
+
+    if report.leaked or (fail_on_git and report.git_sourced):
+        sys.exit(1)

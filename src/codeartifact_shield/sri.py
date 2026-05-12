@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 class PackageRef:
     """Identifier for a single lockfile entry, in CodeArtifact's vocabulary."""
 
-    namespace: str | None  # e.g. "tanstack" for @tanstack/react-query, else None
+    namespace: str | None  # e.g. "babel" for @babel/runtime, else None
     name: str  # e.g. "react-query"
     version: str
 

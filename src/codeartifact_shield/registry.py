@@ -1,0 +1,114 @@
+"""Registry-leakage detection for npm package-lock.json.
+
+A repo that's *meant* to install from AWS CodeArtifact can quietly start
+pulling from the public registry instead — a stray ``resolved`` URL in
+the lockfile is enough. Once that happens, the integrity guarantees of
+the CodeArtifact proxy don't apply to that entry, and a malicious package
+published under the same name on npmjs.com (dependency confusion) can
+land in production.
+
+This module walks ``package-lock.json`` only — no ``.npmrc``, no machine
+config — because the lockfile is what ``npm ci`` actually obeys. The
+project must declare its allowed registry hosts to the checker
+explicitly via ``--allowed-host`` flags.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+
+@dataclass
+class RegistryReport:
+    """Per-host breakdown of where a lockfile resolves its packages from."""
+
+    by_host: dict[str, int] = field(default_factory=dict)
+    """Count of lockfile entries resolved from each host."""
+
+    leaked: list[tuple[str, str]] = field(default_factory=list)
+    """``(lockfile_key, host)`` for entries resolved from a non-allowed host."""
+
+    git_sourced: list[tuple[str, str]] = field(default_factory=list)
+    """``(lockfile_key, ref)`` — entries pulled directly from git, bypassing any registry."""
+
+    file_sourced: list[str] = field(default_factory=list)
+    """Workspace / local-path entries — neither a registry resolution nor a leak."""
+
+    unresolved: list[str] = field(default_factory=list)
+    """Entries with no ``resolved`` field — usually deduped phantoms; can't be classified."""
+
+    @property
+    def clean(self) -> bool:
+        return not self.leaked and not self.git_sourced
+
+    @property
+    def mixed(self) -> bool:
+        """True when more than one distinct host appears in the lockfile."""
+        return len(self.by_host) > 1
+
+
+def _host_allowed(host: str, allowed: Iterable[str]) -> bool:
+    """Case-insensitive substring match. Empty allowed-list means *nothing* is allowed."""
+    host = host.lower()
+    return any(p.lower() in host for p in allowed)
+
+
+def check_npm_registry(
+    lockfile_path: Path,
+    allowed_hosts: Iterable[str],
+) -> RegistryReport:
+    """Inspect every lockfile entry's ``resolved`` URL and classify by host.
+
+    An entry is *leaked* when its tarball was resolved from a host that
+    doesn't match any of the ``allowed_hosts`` substrings. Git-sourced and
+    file/workspace entries are reported separately because they bypass the
+    registry contract entirely — useful signal even if not a registry leak.
+
+    Raises ``ValueError`` for unsupported lockfileVersion 1 (no per-entry
+    ``resolved`` URLs to inspect).
+    """
+    allowed = list(allowed_hosts)
+    if not allowed:
+        raise ValueError("at least one --allowed-host pattern is required")
+
+    lock = json.loads(lockfile_path.read_text())
+    lf_version = lock.get("lockfileVersion")
+    if lf_version not in (2, 3):
+        raise ValueError(
+            f"unsupported lockfileVersion {lf_version}; only v2 and v3 are supported"
+        )
+
+    report = RegistryReport()
+    pkgs: dict[str, dict[str, Any]] = lock.get("packages", {})
+    for key, entry in pkgs.items():
+        if not key:
+            # The "" entry is the project itself.
+            continue
+        if entry.get("link"):
+            # Workspace symlinks resolve to file paths, not a registry.
+            report.file_sourced.append(key)
+            continue
+        if not entry.get("version"):
+            continue
+        resolved = entry.get("resolved")
+        if not resolved:
+            report.unresolved.append(key)
+            continue
+        if resolved.startswith(("file:", "./", "../", "/")):
+            report.file_sourced.append(key)
+            continue
+        if resolved.startswith(("git+", "git:", "github:")) or "+git@" in resolved:
+            report.git_sourced.append((key, resolved))
+            continue
+        parsed = urlparse(resolved)
+        host = parsed.hostname or "(unknown)"
+        report.by_host[host] = report.by_host.get(host, 0) + 1
+        if not _host_allowed(host, allowed):
+            report.leaked.append((key, host))
+
+    return report

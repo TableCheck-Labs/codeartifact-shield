@@ -38,13 +38,13 @@ def test_sri_from_sha512_hex_rejects_wrong_length() -> None:
 
 
 def test_ref_from_lockfile_key_unscoped() -> None:
-    ref = _ref_from_lockfile_key("node_modules/react")
-    assert ref == PackageRef(namespace=None, name="react", version="")
+    ref = _ref_from_lockfile_key("node_modules/lodash")
+    assert ref == PackageRef(namespace=None, name="lodash", version="")
 
 
 def test_ref_from_lockfile_key_scoped() -> None:
-    ref = _ref_from_lockfile_key("node_modules/@tanstack/react-query")
-    assert ref == PackageRef(namespace="tanstack", name="react-query", version="")
+    ref = _ref_from_lockfile_key("node_modules/@babel/runtime")
+    assert ref == PackageRef(namespace="babel", name="runtime", version="")
 
 
 def test_ref_from_lockfile_key_nested() -> None:
@@ -59,8 +59,8 @@ def test_ref_from_lockfile_key_rejects_non_node_modules() -> None:
 
 def test_lockfile_key_round_trip() -> None:
     for key in (
-        "node_modules/react",
-        "node_modules/@tanstack/react-query",
+        "node_modules/lodash",
+        "node_modules/@babel/runtime",
     ):
         ref = _ref_from_lockfile_key(key)
         assert ref is not None
@@ -71,7 +71,7 @@ def test_iter_lockfile_packages_skips_root() -> None:
     lock = json.loads(FIXTURE.read_text())
     keys = [k for k, _ in _iter_lockfile_packages(lock)]
     assert "" not in keys
-    assert "node_modules/react" in keys
+    assert "node_modules/lodash" in keys
 
 
 def test_verify_lockfile_counts_correctly() -> None:
@@ -112,15 +112,15 @@ def test_patch_lockfile_backfills_missing_integrity(tmp_path: Path) -> None:
     lockfile.write_text(FIXTURE.read_text())
 
     # 64-byte SHA-512s — content doesn't matter, just length.
-    sha_react = "a" * 128
-    sha_rq = "b" * 128
-    sha_qc = "c" * 128
+    sha_lodash = "a" * 128
+    sha_runtime = "b" * 128
+    sha_codeframe = "c" * 128
 
     client = _fake_client(
         {
-            ("react", "18.3.1", None): sha_react,
-            ("react-query", "5.90.21", "tanstack"): sha_rq,
-            ("query-core", "5.90.20", "tanstack"): sha_qc,
+            ("lodash", "4.17.21", None): sha_lodash,
+            ("runtime", "7.25.6", "babel"): sha_runtime,
+            ("code-frame", "7.24.7", "babel"): sha_codeframe,
         }
     )
 
@@ -137,10 +137,12 @@ def test_patch_lockfile_backfills_missing_integrity(tmp_path: Path) -> None:
     assert report.api_errors == []
 
     written = json.loads(lockfile.read_text())
-    assert written["packages"]["node_modules/react"]["integrity"] == sri_from_sha512_hex(sha_react)
+    assert written["packages"]["node_modules/lodash"]["integrity"] == sri_from_sha512_hex(
+        sha_lodash
+    )
     assert (
-        written["packages"]["node_modules/@tanstack/react-query"]["integrity"]
-        == sri_from_sha512_hex(sha_rq)
+        written["packages"]["node_modules/@babel/runtime"]["integrity"]
+        == sri_from_sha512_hex(sha_runtime)
     )
     # Pre-existing integrity left untouched.
     assert written["packages"]["node_modules/already-has-integrity"]["integrity"].startswith(
@@ -155,9 +157,9 @@ def test_patch_lockfile_dry_run_leaves_file_alone(tmp_path: Path) -> None:
 
     client = _fake_client(
         {
-            ("react", "18.3.1", None): "a" * 128,
-            ("react-query", "5.90.21", "tanstack"): "b" * 128,
-            ("query-core", "5.90.20", "tanstack"): "c" * 128,
+            ("lodash", "4.17.21", None): "a" * 128,
+            ("runtime", "7.25.6", "babel"): "b" * 128,
+            ("code-frame", "7.24.7", "babel"): "c" * 128,
         }
     )
 
@@ -177,8 +179,8 @@ def test_patch_lockfile_records_missing_packages(tmp_path: Path) -> None:
     lockfile = tmp_path / "package-lock.json"
     lockfile.write_text(FIXTURE.read_text())
 
-    # Only react is in CodeArtifact; the others 404.
-    client = _fake_client({("react", "18.3.1", None): "a" * 128})
+    # Only lodash is in CodeArtifact; the others 404.
+    client = _fake_client({("lodash", "4.17.21", None): "a" * 128})
 
     report = patch_lockfile(
         lockfile,
@@ -189,8 +191,8 @@ def test_patch_lockfile_records_missing_packages(tmp_path: Path) -> None:
 
     assert report.patched == 1
     assert sorted(report.not_in_codeartifact) == [
-        "node_modules/@tanstack/query-core",
-        "node_modules/@tanstack/react-query",
+        "node_modules/@babel/code-frame",
+        "node_modules/@babel/runtime",
     ]
 
 

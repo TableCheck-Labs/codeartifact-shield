@@ -52,13 +52,42 @@ cas drift ./frontend
 Fails (exit 1) with a per-dependency report if `package.json` and
 `package-lock.json` disagree on direct-dep versions.
 
+## 3. Registry leakage — `cas registry`
+
+A project that's *meant* to install through CodeArtifact can quietly start
+resolving entries from `registry.npmjs.org` (or anywhere else). Once one
+entry leaks, the integrity guarantees of the CodeArtifact proxy don't apply
+to it — and a dependency-confusion package published under the same name on
+the public registry can land in production.
+
+```bash
+cas registry ./frontend/package-lock.json \
+  --allowed-host '.d.codeartifact.'
+
+# Multiple allowed hosts (e.g. CodeArtifact + a corporate mirror):
+cas registry ./frontend/package-lock.json \
+  --allowed-host '.d.codeartifact.' \
+  --allowed-host 'mirror.corp.example'
+
+# Also fail on git-sourced dependencies (they bypass any registry):
+cas registry ./frontend/package-lock.json \
+  --allowed-host '.d.codeartifact.' \
+  --fail-on-git
+```
+
+Reads the lockfile only — never `.npmrc` or machine-level npm config —
+because the lockfile is what `npm ci` actually obeys. The project must
+declare its allowed registry hosts explicitly. `--allowed-host` is a
+case-insensitive substring; pass it multiple times to allow several hosts.
+
 ## Wiring it into CI
 
 ```yaml
-- name: SRI integrity gate
+- name: Supply-chain gate
   run: |
     cas drift ./frontend
     cas sri verify ./frontend/package-lock.json --min-coverage 100
+    cas registry ./frontend/package-lock.json --allowed-host '.d.codeartifact.'
 ```
 
 If you're regenerating the lockfile in CI (e.g. after `npm install`), patch
@@ -80,6 +109,7 @@ just needs `codeartifact:ListPackageVersionAssets` on the repository.
 | `sri patch` | all entries reconciled | config error | API errors or packages missing from CodeArtifact |
 | `sri verify` | coverage ≥ threshold | coverage below threshold | — |
 | `drift` | no drift | drift detected | — |
+| `registry` | every entry resolved from an allowed host | leaked entries (or `--fail-on-git` and any git-sourced) | — |
 
 ## Scope
 
