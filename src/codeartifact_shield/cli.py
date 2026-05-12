@@ -402,12 +402,18 @@ def drift_cmd(
         click.echo(
             "  These entries have no parent in the dep graph rooted at "
             "package.json. The most plausible cause is lockfile tampering "
-            "(or a partial regeneration). Re-run `npm install --package-lock-only`.",
+            "(or a partial regeneration). Re-run `npm install --package-lock-only --include=optional --force`.",
             err=True,
         )
 
     click.echo(
-        "\nFix: re-run `npm install --package-lock-only` and commit the regenerated lockfile.",
+        "\nFix: re-run `npm install --package-lock-only --include=optional --force` and commit\n"
+        "the regenerated lockfile.\n"
+        "\n"
+        "  The `--force` flag is REQUIRED — without it, npm prunes every non-current-\n"
+        "  platform optional dep (e.g. `@nx/nx-linux-x64-gnu`, `@rollup/rollup-darwin-\n"
+        "  arm64`) and the Docker build / cross-platform CI breaks at install time.\n"
+        "  See npm/cli#4828 + #7961 — long-standing bug across npm 9, 10, 11.",
         err=True,
     )
     sys.exit(1)
