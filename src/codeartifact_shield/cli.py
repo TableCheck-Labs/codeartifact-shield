@@ -39,6 +39,38 @@ from codeartifact_shield.sri import patch_lockfile, verify_lockfile
 logger = logging.getLogger(__name__)
 
 
+def _emit_load_error(
+    json_output: bool, command: str, target: Path, exc: Exception
+) -> None:
+    """Surface a structural lockfile problem (e.g. v1 lockfileVersion, path
+    traversal in a key) as a clean finding instead of an uncaught traceback.
+
+    Every subcommand that loads a lockfile via ``load_lockfile`` should call
+    this in its except branch — otherwise cas crashes mid-sweep on the first
+    repo it can't parse, which is exactly what happened during the org-wide
+    initial sweep against the v1-format archive repos.
+    """
+    payload = {
+        "command": command,
+        "lockfile": str(target),
+        "clean": False,
+        "findings": [
+            {
+                "severity": Severity.HIGH.value,
+                "type": "lockfile_load_error",
+                "message": str(exc),
+            }
+        ],
+        "severity_counts": {Severity.HIGH.value: 1},
+    }
+    if json_output:
+        emit_json(payload)
+    else:
+        click.echo(
+            f"{severity_badge(Severity.HIGH)} FAIL — {exc}", err=True
+        )
+
+
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__, "-V", "--version", prog_name="cas")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose logging to stderr.")
@@ -312,6 +344,11 @@ def drift_cmd(
                 f"{severity_badge(Severity.HIGH)} SKIP — {exc}", err=True
             )
         sys.exit(1)
+    except ValueError as exc:
+        # v1 lockfile, malformed package keys, or other structural issue
+        # surfaced by load_lockfile.
+        _emit_load_error(json_output, "drift", frontend_dir, exc)
+        sys.exit(1)
 
     findings: list[dict[str, Any]] = []
     for kind, name, declared, actual in report.mismatches:
@@ -424,7 +461,6 @@ def drift_cmd(
     "--allowed-host",
     "allowed_hosts",
     multiple=True,
-    required=True,
     envvar="CAS_ALLOWED_HOSTS",
     help=(
         "Hostname suffix (case-insensitive, label-anchored) that an entry's "
@@ -433,7 +469,10 @@ def drift_cmd(
         "`.d.codeartifact.` are no longer accepted because they let attacker-"
         "controlled hosts of the form `evil.d.codeartifact.attacker.com` slip "
         "through. e.g. "
-        "`--allowed-host .d.codeartifact.ap-northeast-1.amazonaws.com`."
+        "`--allowed-host .d.codeartifact.ap-northeast-1.amazonaws.com`. "
+        "OMIT this flag entirely to auto-detect the project's primary "
+        "registry from the lockfile — useful for sweeping mixed CA + public-"
+        "npm repos where you don't know each project's intended primary."
     ),
 )
 @click.option(
@@ -454,29 +493,12 @@ def registry_cmd(
     json_output: bool,
 ) -> None:
     """Fail the build if the lockfile resolves any package from a non-allowed host."""
+    # Empty tuple from click when --allowed-host wasn't passed → auto-detect.
+    allowed = allowed_hosts if allowed_hosts else None
     try:
-        report = check_npm_registry(lockfile, allowed_hosts)
+        report = check_npm_registry(lockfile, allowed)
     except ValueError as exc:
-        if json_output:
-            emit_json(
-                {
-                    "command": "registry",
-                    "lockfile": str(lockfile),
-                    "clean": False,
-                    "findings": [
-                        {
-                            "severity": Severity.HIGH.value,
-                            "type": "configuration_error",
-                            "message": str(exc),
-                        }
-                    ],
-                    "severity_counts": {Severity.HIGH.value: 1},
-                }
-            )
-        else:
-            click.echo(
-                f"{severity_badge(Severity.HIGH)} FAIL — {exc}", err=True
-            )
+        _emit_load_error(json_output, "registry", lockfile, exc)
         sys.exit(1)
 
     findings: list[dict[str, Any]] = []
@@ -525,6 +547,8 @@ def registry_cmd(
                 "clean": not is_failure,
                 "by_host": dict(report.by_host),
                 "mixed_registries": report.mixed,
+                "detected_primary_hosts": report.detected_primary_hosts,
+                "auto_detect": not allowed_hosts,
                 "findings": findings,
                 "severity_counts": severity_counts(findings),
             }
@@ -533,9 +557,17 @@ def registry_cmd(
             sys.exit(1)
         return
 
+    if report.detected_primary_hosts:
+        click.echo(
+            "Auto-detected primary registries (no --allowed-host given): "
+            + ", ".join(report.detected_primary_hosts)
+        )
     click.echo("Resolved-host distribution:")
+    effective_allowed = (
+        report.detected_primary_hosts if not allowed_hosts else list(allowed_hosts)
+    )
     for host, count in sorted(report.by_host.items(), key=lambda kv: -kv[1]):
-        marker = "OK" if host_allowed(host, allowed_hosts) else "LEAK"
+        marker = "OK" if host_allowed(host, effective_allowed) else "LEAK"
         click.echo(f"  [{marker}] {host}: {count}")
     if report.mixed:
         click.echo("WARN — mixed registries: lockfile resolves from more than one host.")
@@ -600,7 +632,11 @@ def scripts_cmd(
     json_output: bool,
 ) -> None:
     """Fail if any lockfile entry will run lifecycle scripts at install time."""
-    report = check_install_scripts(lockfile, allowed=allowed)
+    try:
+        report = check_install_scripts(lockfile, allowed=allowed)
+    except ValueError as exc:
+        _emit_load_error(json_output, "scripts", lockfile, exc)
+        sys.exit(1)
 
     findings: list[dict[str, Any]] = []
     for f in report.flagged:

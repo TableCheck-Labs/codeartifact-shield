@@ -235,6 +235,95 @@ def test_sri_json_clean_lockfile(tmp_path: Path) -> None:
     assert payload["total"] == 1
 
 
+# ---------------------------------------------------------------------------
+# v1 lockfile / structural error handling: cas drift/registry/scripts must
+# emit a clean [HIGH] FAIL line, not a Python traceback. Found during an
+# org-wide sweep that crashed on every npm-6-era archive repo.
+# ---------------------------------------------------------------------------
+
+
+def _write_v1_lockfile(tmp_path: Path) -> Path:
+    p = tmp_path / "package-lock.json"
+    p.write_text(json.dumps({"lockfileVersion": 1, "dependencies": {}}))
+    return p
+
+
+def test_drift_emits_clean_error_on_v1_lockfile(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text("{}")
+    _write_v1_lockfile(tmp_path)
+    result = CliRunner().invoke(main, ["drift", str(tmp_path)])
+    assert result.exit_code == 1
+    assert "Traceback" not in result.stderr
+    assert "unsupported lockfileVersion" in result.stderr
+    assert "[HIGH]" in result.stderr
+
+
+def test_drift_v1_lockfile_json(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text("{}")
+    _write_v1_lockfile(tmp_path)
+    result = CliRunner().invoke(main, ["drift", str(tmp_path), "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["clean"] is False
+    assert payload["findings"][0]["type"] == "lockfile_load_error"
+
+
+def test_registry_emits_clean_error_on_v1_lockfile(tmp_path: Path) -> None:
+    lf = _write_v1_lockfile(tmp_path)
+    result = CliRunner().invoke(main, ["registry", str(lf)])
+    assert result.exit_code == 1
+    assert "Traceback" not in result.stderr
+    assert "unsupported lockfileVersion" in result.stderr
+
+
+def test_scripts_emits_clean_error_on_v1_lockfile(tmp_path: Path) -> None:
+    lf = _write_v1_lockfile(tmp_path)
+    result = CliRunner().invoke(main, ["scripts", str(lf)])
+    assert result.exit_code == 1
+    assert "Traceback" not in result.stderr
+    assert "unsupported lockfileVersion" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Auto-detect at the CLI level.
+# ---------------------------------------------------------------------------
+
+
+def test_registry_no_allowed_host_triggers_auto_detect(tmp_path: Path) -> None:
+    lf = _write_lock(
+        tmp_path,
+        {
+            "node_modules/a": {
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+            },
+        },
+    )
+    result = CliRunner().invoke(main, ["registry", str(lf), "--json"])
+    # Single host, no leaks expected — auto-detect picks npmjs.org.
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["clean"] is True
+
+
+def test_registry_auto_detect_surfaces_detected_hosts_in_json(tmp_path: Path) -> None:
+    lf = _write_lock(
+        tmp_path,
+        {
+            f"node_modules/p{i}": {
+                "version": "1.0.0",
+                "resolved": f"https://acme-1.d.codeartifact.us-east-1.amazonaws.com/-/p{i}.tgz",
+            }
+            for i in range(20)
+        },
+    )
+    result = CliRunner().invoke(main, ["registry", str(lf), "--json"])
+    payload = json.loads(result.stdout)
+    # We don't expose detected_primary_hosts on top-level JSON yet; the
+    # human/json output should at minimum mark it clean.
+    assert payload["clean"] is True
+
+
 def test_json_output_is_parseable(tmp_path: Path) -> None:
     """--json mode must produce parseable JSON on stdout."""
     lf = _write_lock(

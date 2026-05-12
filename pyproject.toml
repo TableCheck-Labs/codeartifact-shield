@@ -1,6 +1,6 @@
 [project]
 name = "codeartifact-shield"
-version = "0.3.1"
+version = "0.4.0"
 description = "npm supply-chain hardening for AWS CodeArtifact: backfills the SRI integrity hashes CodeArtifact strips from package-lock.json, and fails the build on package.json/lockfile drift."
 readme = "README.md"
 requires-python = ">=3.10"

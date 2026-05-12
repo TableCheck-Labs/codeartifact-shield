@@ -301,6 +301,155 @@ def test_http_resolved_url_is_leaked_even_with_allowed_host(tmp_path: Path) -> N
     assert report.leaked[0][0] == "node_modules/sneaky"
 
 
+# ---------------------------------------------------------------------------
+# Auto-detect primary registry: when no --allowed-host is given, cas infers
+# the project's primary registry from the lockfile itself and gates against it.
+# Threat model: a project is "on CA" or "on public npm"; one anomalous host
+# in either case is a leak. The user shouldn't have to declare per-project
+# which type they are — cas can read it from `resolved` URLs.
+# ---------------------------------------------------------------------------
+
+
+def test_auto_detect_codeartifact_primary_is_clean(tmp_path: Path) -> None:
+    """100% CodeArtifact lockfile — auto-detect should mark it clean."""
+    lf = _write(
+        tmp_path,
+        {
+            "node_modules/a": {
+                "version": "1.0.0",
+                "resolved": "https://acme-1234.d.codeartifact.us-east-1.amazonaws.com/-/a.tgz",
+            },
+            "node_modules/b": {
+                "version": "2.0.0",
+                "resolved": "https://acme-1234.d.codeartifact.us-east-1.amazonaws.com/-/b.tgz",
+            },
+        },
+    )
+    report = check_npm_registry(lf, allowed_hosts=None)
+    assert report.clean
+    assert report.detected_primary_hosts == [
+        "acme-1234.d.codeartifact.us-east-1.amazonaws.com"
+    ]
+
+
+def test_auto_detect_public_npm_primary_is_clean(tmp_path: Path) -> None:
+    """100% npmjs.org lockfile — that's the primary; auto-detect makes it clean."""
+    lf = _write(
+        tmp_path,
+        {
+            "node_modules/a": {
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+            },
+            "node_modules/b": {
+                "version": "2.0.0",
+                "resolved": "https://registry.npmjs.org/b/-/b-2.0.0.tgz",
+            },
+        },
+    )
+    report = check_npm_registry(lf, allowed_hosts=None)
+    assert report.clean
+    assert report.detected_primary_hosts == ["registry.npmjs.org"]
+
+
+def test_auto_detect_flags_minority_host_as_leak(tmp_path: Path) -> None:
+    """90% CodeArtifact + one stray npmjs entry → that one is leaked."""
+    pkgs = {
+        f"node_modules/p{i}": {
+            "version": "1.0.0",
+            "resolved": f"https://acme-1234.d.codeartifact.us-east-1.amazonaws.com/-/p{i}.tgz",
+        }
+        for i in range(9)
+    }
+    pkgs["node_modules/sneaky"] = {
+        "version": "1.0.0",
+        "resolved": "https://registry.npmjs.org/sneaky/-/sneaky-1.0.0.tgz",
+    }
+    lf = _write(tmp_path, pkgs)
+    report = check_npm_registry(lf, allowed_hosts=None)
+    assert not report.clean
+    assert report.detected_primary_hosts == [
+        "acme-1234.d.codeartifact.us-east-1.amazonaws.com"
+    ]
+    assert report.leaked == [("node_modules/sneaky", "registry.npmjs.org")]
+
+
+def test_auto_detect_flags_codeartifact_anomaly_in_public_project(
+    tmp_path: Path,
+) -> None:
+    """A repo that's primarily on public npm with one stray CA entry — still a leak.
+
+    The check is symmetric: any host that isn't the project's primary is a
+    finding regardless of which is "more secure" by absolute standards.
+    """
+    pkgs = {
+        f"node_modules/p{i}": {
+            "version": "1.0.0",
+            "resolved": f"https://registry.npmjs.org/p{i}/-/p{i}-1.0.0.tgz",
+        }
+        for i in range(9)
+    }
+    pkgs["node_modules/stray-ca"] = {
+        "version": "1.0.0",
+        "resolved": "https://acme-1234.d.codeartifact.us-east-1.amazonaws.com/-/stray.tgz",
+    }
+    lf = _write(tmp_path, pkgs)
+    report = check_npm_registry(lf, allowed_hosts=None)
+    assert not report.clean
+    assert report.detected_primary_hosts == ["registry.npmjs.org"]
+    assert report.leaked == [
+        (
+            "node_modules/stray-ca",
+            "acme-1234.d.codeartifact.us-east-1.amazonaws.com",
+        )
+    ]
+
+
+def test_auto_detect_accepts_multi_host_when_both_substantial(
+    tmp_path: Path,
+) -> None:
+    """A 50/50 split between two registries (e.g., CA + corp mirror) means
+    both are primary — neither is a leak relative to the other."""
+    pkgs = {
+        f"node_modules/p{i}": {
+            "version": "1.0.0",
+            "resolved": f"https://acme-1234.d.codeartifact.us-east-1.amazonaws.com/-/p{i}.tgz",
+        }
+        for i in range(50)
+    }
+    pkgs.update({
+        f"node_modules/m{i}": {
+            "version": "1.0.0",
+            "resolved": f"https://internal-mirror.corp/-/m{i}.tgz",
+        }
+        for i in range(50)
+    })
+    lf = _write(tmp_path, pkgs)
+    report = check_npm_registry(lf, allowed_hosts=None)
+    assert report.clean, "two roughly-equal hosts should both be primary"
+    assert set(report.detected_primary_hosts) == {
+        "acme-1234.d.codeartifact.us-east-1.amazonaws.com",
+        "internal-mirror.corp",
+    }
+
+
+def test_explicit_allowed_host_overrides_auto_detect(tmp_path: Path) -> None:
+    """Existing --allowed-host behavior is unchanged: explicit is strict."""
+    lf = _write(
+        tmp_path,
+        {
+            "node_modules/a": {
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+            },
+        },
+    )
+    # An explicit (non-matching) allowed-host still wins over auto-detect.
+    report = check_npm_registry(lf, [".d.codeartifact.us-east-1.amazonaws.com"])
+    assert not report.clean
+    assert report.leaked == [("node_modules/a", "registry.npmjs.org")]
+
+
 def test_unknown_scheme_resolved_url_is_leaked(tmp_path: Path) -> None:
     """ftp://, ws://, etc. — anything that's not https:// (or one of the
     explicitly-classified git+/file:/link: schemes) is treated as leaked."""

@@ -15,6 +15,7 @@ explicitly via ``--allowed-host`` flags.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,6 +53,15 @@ class RegistryReport:
     can distinguish legitimate ``bundleDependencies`` from suspicious phantoms.
     The SRI gate (``cas sri verify``) is what actually anchors these to the
     parent's integrity hash."""
+
+    detected_primary_hosts: list[str] = field(default_factory=list)
+    """When auto-detect is used (no explicit ``--allowed-host`` flags), the
+    hosts cas inferred from the lockfile as the project's legitimate registries.
+    A mix of CodeArtifact + public npm is common during migrations and is
+    accepted — both count as primary as long as each carries a substantial
+    share of the entries. One-off anomalies (an attacker-pinned host appearing
+    once in a tampered lockfile) fall below the threshold and are reported as
+    leaks. Empty when explicit ``--allowed-host`` patterns were supplied."""
 
     @property
     def clean(self) -> bool:
@@ -99,9 +109,38 @@ def host_allowed(host: str, allowed: Iterable[str]) -> bool:
 _host_allowed = host_allowed
 
 
+_AUTO_DETECT_SECONDARY_RATIO = 0.2
+"""Auto-detect threshold: any host with >= 20% of the top host's entry count
+is also accepted as primary. Below that, the host is treated as an anomaly
+(potential leak). 20% is high enough to accept legitimate multi-registry
+setups (CodeArtifact + corporate mirror; a project mid-migration with most
+entries on one registry and a chunk on another) but low enough to catch a
+single dep-confusion entry slipping into an otherwise-consistent lockfile."""
+
+
+def _auto_detect_primary_hosts(hosts_by_count: dict[str, int]) -> list[str]:
+    """Pick every host that meets the auto-detect threshold.
+
+    Algorithm: find the top host by entry count. Every host with at least
+    ``ratio * top_count`` entries is "primary." Returns hosts sorted by
+    descending count.
+    """
+    if not hosts_by_count:
+        return []
+    top_count = max(hosts_by_count.values())
+    # Round UP so a 9-entry top + 1-entry secondary doesn't accidentally
+    # accept the secondary at the 1-entry floor (ceil(9*0.2)=2 > 1, leak).
+    threshold = max(1, math.ceil(top_count * _AUTO_DETECT_SECONDARY_RATIO))
+    return [
+        host
+        for host, _ in sorted(hosts_by_count.items(), key=lambda kv: -kv[1])
+        if hosts_by_count[host] >= threshold
+    ]
+
+
 def check_npm_registry(
     lockfile_path: Path,
-    allowed_hosts: Iterable[str],
+    allowed_hosts: Iterable[str] | None = None,
 ) -> RegistryReport:
     """Inspect every lockfile entry's ``resolved`` URL and classify by host.
 
@@ -110,17 +149,62 @@ def check_npm_registry(
     file/workspace entries are reported separately because they bypass the
     registry contract entirely — useful signal even if not a registry leak.
 
+    Pass ``allowed_hosts=None`` (or omit the argument) to auto-detect the
+    project's primary registry from the lockfile itself. Auto-detect picks
+    every host that holds at least 20% of the top host's entry count, so a
+    project that legitimately uses CodeArtifact + npm (or CA + a corporate
+    mirror) passes cleanly; only true one-off anomalies (which is what a
+    dependency-confusion attack would look like) get flagged. The detected
+    list is returned in ``report.detected_primary_hosts``.
+
     Raises ``ValueError`` for unsupported lockfileVersion 1 (no per-entry
     ``resolved`` URLs to inspect).
     """
-    allowed = list(allowed_hosts)
-    if not allowed:
-        raise ValueError("at least one --allowed-host pattern is required")
+    if allowed_hosts is None:
+        explicit_allowed: list[str] | None = None
+    else:
+        explicit_allowed = list(allowed_hosts)
+        if not explicit_allowed:
+            # Caller passed an empty list — that's ambiguous between "use
+            # auto-detect" and "I forgot to set this." Treat as a config
+            # error so the caller has to pick explicitly.
+            raise ValueError(
+                "at least one --allowed-host pattern is required "
+                "(or omit the flag entirely for auto-detect)"
+            )
+    auto_detect = explicit_allowed is None
 
     lock = load_lockfile(lockfile_path)
 
-    report = RegistryReport()
+    # First pass: build the host-distribution histogram. We need it before
+    # classifying entries when in auto-detect mode.
     pkgs: dict[str, dict[str, Any]] = lock.get("packages", {})
+    histogram: dict[str, int] = {}
+    for key, entry in pkgs.items():
+        if not key or entry.get("link") or not entry.get("version"):
+            continue
+        resolved = entry.get("resolved")
+        if not resolved or resolved.startswith(
+            ("file:", "./", "../", "/", "git+", "git:", "github:")
+        ):
+            continue
+        if "+git@" in resolved:
+            continue
+        parsed = urlparse(resolved)
+        if parsed.scheme != "https":
+            continue
+        host = parsed.hostname or "(unknown)"
+        histogram[host] = histogram.get(host, 0) + 1
+
+    if auto_detect:
+        primary = _auto_detect_primary_hosts(histogram)
+        allowed: list[str] = primary
+    else:
+        primary = []
+        allowed = explicit_allowed or []
+
+    report = RegistryReport()
+    report.detected_primary_hosts = primary
     for key, entry in pkgs.items():
         if not key:
             # The "" entry is the project itself.
