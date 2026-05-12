@@ -29,33 +29,7 @@ Every command:
 
 ---
 
-## What changed in v0.4.0
-
-* **`cas registry` auto-detects the project's primary registry** when
-  `--allowed-host` is omitted. Reads the lockfile's `resolved` URL
-  distribution and treats every host carrying ≥20% of the top host's entry
-  count as primary. A 100%-CodeArtifact lockfile, a 100%-public-npm
-  lockfile, a CodeArtifact + corporate-mirror mix — all three pass cleanly.
-  One-off anomalies (the dependency-confusion attack signature) still fall
-  below the threshold and are flagged as CRITICAL. Strict mode (with one
-  or more `--allowed-host` flags) is **unchanged**.
-* **v1-lockfile traceback fix.** `cas drift` / `cas registry` /
-  `cas scripts` now catch the unsupported-format `ValueError` from the
-  lockfile loader and emit a clean `[HIGH] FAIL — unsupported
-  lockfileVersion 1` instead of a Python stack trace. Discovered during an
-  org-wide sweep that crashed on 18 npm-6-era archive repos.
-* `RegistryReport.detected_primary_hosts: list[str]` surfaces in both
-  human and JSON output when auto-detect is active.
-
-## What changed in v0.3.0
-
-* **Severity badges in human output.** Every finding line gets a
-  `[CRITICAL]` / `[HIGH]` / `[MEDIUM]` / `[LOW]` / `[INFO]` prefix.
-  Severities reflect blast radius (see the table below), not finding count.
-* **`--json` flag on every subcommand.** Emits a stable, parseable schema
-  on stdout for downstream consumption.
-
-### Severity ladder
+## Severity ladder
 
 | Severity | Type                                  | Meaning                                                        |
 | -------- | ------------------------------------- | -------------------------------------------------------------- |
@@ -65,7 +39,7 @@ Every command:
 | LOW      | `unresolved_phantom`                  | Suspicious-but-explainable lockfile entry                      |
 | INFO     | `bundled`, `install_script_allowed`   | Context only, not a failure                                    |
 
-### `--json` output schema
+## `--json` output schema
 
 ```json
 {
@@ -87,34 +61,6 @@ Exit code is still `1` on any failure-tier finding; `--json` only changes
 the output format. All human banner text in `--json` mode is routed to
 stderr so stdout remains a clean JSON document for piping into `jq` or
 SARIF converters.
-
-## What changed in v0.2.0
-
-Security-driven changes; **some are breaking**. Review before upgrading.
-
-* **`cas registry` is label-anchored, not substring.** A pattern like
-  `.d.codeartifact.` used to substring-match anything containing those
-  characters — including attacker-controlled hosts of the form
-  `evil.d.codeartifact.attacker.com`. Patterns now match at hostname-label
-  boundaries: a host must *equal* the pattern or *end with* `.` + the pattern.
-* **`cas registry` requires HTTPS.** A `resolved` URL using `http://`,
-  `ftp://`, or any non-https scheme is treated as a CRITICAL leak even if
-  the host is in the allowlist.
-* **`cas sri verify` rejects sha1 integrity.** SHA-1 is collision-broken and
-  was removed from the modern SRI spec. Lockfile entries whose only integrity
-  is `sha1-…` count as missing; `cas sri patch` overwrites them with sha512
-  from CodeArtifact.
-* **`cas sri verify` correctly handles `bundleDependencies`.** Bundled
-  entries (`inBundle: true`) are counted in the denominator AND credited
-  to their parent's integrity hash. A 100% threshold is honestly reachable;
-  an orphan-bundled entry (parent has no integrity) fails closed.
-* **`cas drift` detects orphan lockfile entries** unreachable from any
-  `package.json` declaration (root or transitive) — the most plausible
-  footprint of a malicious lockfile insertion.
-* **`cas scripts` is new.**
-* **Lockfile path-traversal validation.** Every subcommand refuses to
-  operate on a lockfile whose package keys contain `..`, leading `/`,
-  backslashes, or null bytes.
 
 ## Why this exists
 
