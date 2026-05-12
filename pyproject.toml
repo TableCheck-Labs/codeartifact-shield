@@ -25,6 +25,7 @@ classifiers = [
 dependencies = [
     "boto3==1.43.6",
     "click==8.3.0",
+    "node-semver==0.9.0",
 ]
 
 [project.optional-dependencies]
@@ -63,6 +64,10 @@ python_version = "3.10"
 strict = true
 warn_unused_ignores = true
 warn_redundant_casts = true
+
+[[tool.mypy.overrides]]
+module = "nodesemver"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

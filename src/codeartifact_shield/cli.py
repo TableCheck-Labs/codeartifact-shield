@@ -140,24 +140,60 @@ def sri_verify(lockfile: Path, min_coverage: float) -> None:
     "frontend_dir",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
 )
-def drift_cmd(frontend_dir: Path) -> None:
+@click.option(
+    "--ranges",
+    is_flag=True,
+    help="Treat package.json declarations as SemVer ranges instead of "
+    "requiring literal equality. Use when the project doesn't pin exact "
+    "versions in package.json.",
+)
+@click.option(
+    "--no-transitive",
+    is_flag=True,
+    help="Skip transitive drift detection (only check direct deps).",
+)
+def drift_cmd(frontend_dir: Path, ranges: bool, no_transitive: bool) -> None:
     """Fail if ``package.json`` and ``package-lock.json`` disagree on versions.
 
     Catches the case where a developer edits one file but forgets the
     other — exactly the inconsistent state an attacker would create by
-    tampering with the lockfile alone.
+    tampering with the lockfile alone. By default also walks every
+    lockfile entry's own dependency declarations and verifies each
+    transitive resolves to a version within its declared range.
     """
     try:
-        report = check_npm_drift(frontend_dir)
+        report = check_npm_drift(
+            frontend_dir, ranges=ranges, transitive=not no_transitive
+        )
     except FileNotFoundError as exc:
         click.echo(f"SKIP — {exc}", err=True)
         sys.exit(1)
     if report.clean:
-        click.echo("OK — package.json and package-lock.json agree on direct-dep versions.")
+        click.echo("OK — package.json and package-lock.json agree on declared versions.")
         return
-    click.echo("Drift detected:", err=True)
-    for kind, name, declared, actual in report.mismatches:
-        click.echo(f"  {kind}.{name}: package.json={declared} lockfile={actual}", err=True)
+
+    if report.mismatches:
+        click.echo(f"Direct drift ({len(report.mismatches)}):", err=True)
+        for kind, name, declared, actual in report.mismatches:
+            click.echo(
+                f"  {kind}.{name}: package.json={declared} lockfile={actual}",
+                err=True,
+            )
+
+    if report.transitive_mismatches:
+        click.echo(
+            f"\nTransitive drift ({len(report.transitive_mismatches)}):", err=True
+        )
+        for parent, child, declared, actual in report.transitive_mismatches[:50]:
+            click.echo(
+                f"  {parent} -> {child}: declared={declared} resolved={actual}",
+                err=True,
+            )
+        if len(report.transitive_mismatches) > 50:
+            click.echo(
+                f"  ... and {len(report.transitive_mismatches) - 50} more", err=True
+            )
+
     click.echo(
         "\nFix: re-run `npm install --package-lock-only` and commit the regenerated lockfile.",
         err=True,
