@@ -12,6 +12,9 @@ Five commands, single responsibility each:
 * ``cas scripts`` — fail if any dep declares preinstall/install/postinstall.
 * ``cas pin`` — fail if any direct ``package.json`` dep declaration is a
   range, dist-tag, or otherwise unpinned spec instead of an exact version.
+* ``cas audit`` — `npm audit` equivalent that works behind CodeArtifact.
+  Queries OSV.dev directly so the audit endpoint CodeArtifact doesn't
+  proxy is no longer a blind spot.
 
 Designed to be dropped into a CI step; every command exits nonzero on a
 finding, and every command supports ``--json`` for machine-readable output.
@@ -33,6 +36,7 @@ from codeartifact_shield._output import (
     severity_badge,
     severity_counts,
 )
+from codeartifact_shield.audit import SEVERITY_RANK, audit_lockfile
 from codeartifact_shield.drift import check_npm_drift
 from codeartifact_shield.pins import DEFAULT_SCOPES, check_pinning
 from codeartifact_shield.registry import check_npm_registry, host_allowed
@@ -877,3 +881,174 @@ def pin_cmd(
         f"OK — all {report.total_checked} direct-dep declarations are pinned "
         f"({', '.join(effective_scopes)})."
     )
+
+
+# ---------------------------------------------------------------------------
+# audit — vulnerability audit against OSV.dev (npm audit for CodeArtifact)
+# ---------------------------------------------------------------------------
+
+
+_AUDIT_SEVERITY_TO_CAS = {
+    "CRITICAL": Severity.CRITICAL,
+    "HIGH": Severity.HIGH,
+    "MEDIUM": Severity.MEDIUM,
+    "LOW": Severity.LOW,
+    "UNKNOWN": Severity.LOW,
+}
+
+
+@main.command("audit")
+@click.argument("lockfile", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--allow",
+    "allowed",
+    multiple=True,
+    envvar="CAS_AUDIT_ALLOW",
+    help=(
+        "Vuln ID (GHSA / CVE / OSV) to suppress. Repeatable. Matched "
+        "case-insensitively against the primary id and aliases."
+    ),
+)
+@click.option(
+    "--min-severity",
+    type=click.Choice(["critical", "high", "medium", "moderate", "low"]),
+    default=None,
+    help=(
+        "Only report findings at or above this severity. Default: report "
+        "all findings (matches `npm audit` default)."
+    ),
+)
+@click.option(
+    "--whitelist",
+    "whitelist_file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    envvar="CAS_AUDIT_WHITELIST",
+    default=None,
+    help=(
+        "Path to a whitelist file. Two formats accepted: the `auditjs` / "
+        "Sonatype OSS Index format `{\"ignore\":[{\"id\":\"CVE-...\"}]}`, "
+        "or a plain JSON array of vuln IDs. IDs from the file are merged "
+        "with any `--allow` flags."
+    ),
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Emit a machine-readable JSON report on stdout instead of human text.",
+)
+def audit_cmd(
+    lockfile: Path,
+    allowed: tuple[str, ...],
+    min_severity: str | None,
+    whitelist_file: Path | None,
+    json_output: bool,
+) -> None:
+    """Query OSV.dev for known vulnerabilities in every (name, version) in the lockfile."""
+    floor = None
+    if min_severity:
+        floor = "MEDIUM" if min_severity.lower() == "moderate" else min_severity.upper()
+
+    try:
+        report = audit_lockfile(
+            lockfile,
+            allow_ids=allowed,
+            severity_floor=floor,
+            whitelist_file=whitelist_file,
+        )
+    except ValueError as exc:
+        _emit_load_error(json_output, "audit", lockfile, exc)
+        sys.exit(1)
+
+    if report.network_error:
+        if json_output:
+            emit_json(
+                {
+                    "command": "audit",
+                    "lockfile": str(lockfile),
+                    "clean": False,
+                    "total_checked": report.total_checked,
+                    "findings": [
+                        {
+                            "severity": Severity.HIGH.value,
+                            "type": "audit_network_error",
+                            "message": report.network_error,
+                        }
+                    ],
+                    "severity_counts": {Severity.HIGH.value: 1},
+                }
+            )
+        else:
+            click.echo(
+                f"{severity_badge(Severity.HIGH)} FAIL — {report.network_error}",
+                err=True,
+            )
+        sys.exit(1)
+
+    findings_payload: list[dict[str, Any]] = []
+    for f in report.findings:
+        sev = _AUDIT_SEVERITY_TO_CAS.get(f.severity, Severity.LOW)
+        findings_payload.append(
+            {
+                "severity": sev.value,
+                "type": "vulnerability",
+                "package": f.package_name,
+                "version": f.version,
+                "vuln_id": f.vuln_id,
+                "vuln_severity": f.severity,
+                "summary": f.summary,
+                "fixed_in": f.fixed_in,
+                "aliases": f.aliases,
+            }
+        )
+
+    if json_output:
+        emit_json(
+            {
+                "command": "audit",
+                "lockfile": str(lockfile),
+                "clean": report.clean,
+                "total_checked": report.total_checked,
+                "findings": findings_payload,
+                "severity_counts": severity_counts(findings_payload),
+            }
+        )
+        if not report.clean:
+            sys.exit(1)
+        return
+
+    if not report.findings:
+        click.echo(
+            f"OK — {report.total_checked} packages audited, no vulnerabilities."
+        )
+        return
+
+    by_severity_rank = sorted(
+        report.findings,
+        key=lambda f: -SEVERITY_RANK.get(f.severity, 0),
+    )
+    click.echo(
+        f"\nVulnerabilities found ({len(report.findings)} across "
+        f"{report.total_checked} packages):",
+        err=True,
+    )
+    for f in by_severity_rank:
+        cas_sev = _AUDIT_SEVERITY_TO_CAS.get(f.severity, Severity.LOW)
+        aliases = f", aliases: {', '.join(f.aliases)}" if f.aliases else ""
+        fixed = f"  Fixed in: {f.fixed_in}" if f.fixed_in else "  Fixed in: (no patch)"
+        click.echo(
+            f"  {severity_badge(cas_sev)} {f.package_name}@{f.version}  "
+            f"{f.vuln_id}{aliases}",
+            err=True,
+        )
+        if f.summary:
+            click.echo(f"    {f.summary}", err=True)
+        click.echo(fixed, err=True)
+    click.echo(
+        "\nFix: bump to the indicated `Fixed in` versions. To suppress an "
+        "accepted-risk finding, pass `--allow <GHSA-id>` (repeat as needed) "
+        "or set `CAS_AUDIT_ALLOW`. To gate only on high+, pass "
+        "`--min-severity high`.",
+        err=True,
+    )
+    sys.exit(1)

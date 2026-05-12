@@ -20,6 +20,9 @@ cas pin         fail when any direct package.json declaration is a
                 range (^1.2.3, ~1.2.3, >=1.0), dist-tag (latest, *),
                 tarball URL, file:/link: path, or git ref that isn't a
                 full 40-char commit SHA
+cas audit       npm-audit equivalent that works behind CodeArtifact —
+                queries OSV.dev directly so the audit endpoint
+                CodeArtifact doesn't proxy is no longer a blind spot
 ```
 
 Every command:
@@ -530,6 +533,133 @@ cas pin . --json | jq '.findings[] | select(.severity == "HIGH")'
 
 ---
 
+## `cas audit`
+
+`npm audit` equivalent that works behind AWS CodeArtifact. CodeArtifact's
+npm proxy does not implement the audit endpoint
+(`/-/npm/v1/security/advisories/bulk`), so `npm audit` against a
+CodeArtifact-proxied registry silently returns no findings. `cas audit`
+queries the [OSV.dev](https://osv.dev) API directly — the same federated
+database `osv-scanner` uses, covering the GitHub Advisory Database,
+npm's own advisory feed, and others. No authentication is required.
+
+```
+cas audit [OPTIONS] LOCKFILE
+```
+
+| Flag                | Behavior                                                                                                                                                                                                                                                                  |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--allow TEXT`      | Vuln ID (`GHSA-...`, `CVE-...`, `OSV-...`) to suppress. Repeatable. Matched case-insensitively against the primary id **and** each alias. Env: `CAS_AUDIT_ALLOW` (whitespace-separated).                                                                              |
+| `--min-severity SEV`| Only report findings at or above this severity. Choices: `critical`, `high`, `medium`/`moderate`, `low`. Default: report all (matches `npm audit` default).                                                                                                              |
+| `--whitelist FILE`  | Path to a whitelist file. Two formats accepted (see below). Env: `CAS_AUDIT_WHITELIST`. IDs from the file are merged with `--allow` flags.                                                                                                                                |
+| `--json`            | Machine-readable JSON on stdout instead of human text.                                                                                                                                                                                                                    |
+| `-h`, `--help`      | Show help.                                                                                                                                                                                                                                                                |
+
+### Whitelist file formats
+
+cas accepts two shapes for `--whitelist`:
+
+**1. `auditjs` / Sonatype OSS Index format** (what `auditjs` emits and
+what TableCheck-style projects already maintain):
+
+```json
+{
+  "ignore": [
+    {"id": "CVE-2023-42282"},
+    {"id": "CVE-2024-21540"}
+  ]
+}
+```
+
+A top-level `affected` array (the audit results `auditjs` writes
+alongside `ignore`) is tolerated and ignored — only `ignore[].id` is
+read. This means you can point cas at an existing `auditjs.json` without
+modification.
+
+**2. Plain JSON array of strings**:
+
+```json
+["GHSA-aaaa-bbbb-cccc", "CVE-2024-99999"]
+```
+
+Any other top-level shape is rejected with a clear error.
+
+### Severity mapping
+
+OSV.dev's `database_specific.severity` field (a string) maps to cas
+severity badges as follows:
+
+| OSV severity   | cas severity |
+| -------------- | ------------ |
+| `CRITICAL`     | `CRITICAL`   |
+| `HIGH`         | `HIGH`       |
+| `MODERATE`     | `MEDIUM`     |
+| `LOW`          | `LOW`        |
+| (none / unknown) | `LOW`      |
+
+`UNKNOWN` is bucketed as `LOW` rather than dropped — an unclassified
+advisory is suspicious-but-explainable, not safe.
+
+### Examples
+
+```bash
+# Default — report every vulnerability:
+cas audit ./package-lock.json
+
+# Reuse an existing auditjs.json whitelist:
+cas audit ./package-lock.json --whitelist ./auditjs.json
+
+# Gate CI on high-and-critical only, with a whitelist for accepted risk:
+cas audit ./package-lock.json --min-severity high --whitelist ./auditjs.json
+
+# Suppress a single advisory inline (one-off):
+cas audit ./package-lock.json --allow GHSA-5c6j-r48x-rmvq
+
+# Machine-readable for dashboards:
+cas audit ./package-lock.json --json | jq '.findings[] | select(.severity == "CRITICAL")'
+```
+
+### Network requirements
+
+`cas audit` makes outbound HTTPS requests to `api.osv.dev`:
+
+* **POST** `/v1/querybatch` — one request per 1000 (name, version)
+  pairs. A typical SPA lockfile (~2500 packages) sends 3 batched
+  requests.
+* **GET** `/v1/vulns/{id}` — one request per unique vuln ID returned
+  by the batch query. Typically <20 for a healthy project.
+
+If `api.osv.dev` is unreachable, cas emits a `[HIGH] FAIL` finding of
+type `audit_network_error` and exits `1` — never silently returns
+"clean" when it couldn't actually check.
+
+### JSON schema
+
+```json
+{
+  "command": "audit",
+  "lockfile": "/path/to/package-lock.json",
+  "clean": false,
+  "total_checked": 2524,
+  "findings": [
+    {
+      "severity": "HIGH",
+      "type": "vulnerability",
+      "package": "serialize-javascript",
+      "version": "6.0.2",
+      "vuln_id": "GHSA-5c6j-r48x-rmvq",
+      "vuln_severity": "HIGH",
+      "summary": "Serialize JavaScript is Vulnerable to RCE...",
+      "fixed_in": "7.0.3",
+      "aliases": ["CVE-2024-11831"]
+    }
+  ],
+  "severity_counts": {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+}
+```
+
+---
+
 ## Lockfile structure validation
 
 Every command refuses to operate on a structurally-suspect lockfile
@@ -557,6 +687,8 @@ the check is consistent everywhere.
 | `CAS_ALLOWED_HOSTS`       | `cas registry`       | Whitespace-separated default for `--allowed-host`.          |
 | `CAS_ALLOWED_SCRIPTS`     | `cas scripts`        | Whitespace-separated default for `--allow`.                 |
 | `CAS_ALLOWED_UNPINNED`    | `cas pin`            | Whitespace-separated default for `--allow`.                 |
+| `CAS_AUDIT_ALLOW`         | `cas audit`          | Whitespace-separated default for `--allow`.                 |
+| `CAS_AUDIT_WHITELIST`     | `cas audit`          | Default path for `--whitelist`.                             |
 | Standard `AWS_*`          | `cas sri patch`      | Picked up by boto3 for CodeArtifact API auth.               |
 
 ---
@@ -595,6 +727,10 @@ A complete gate looks like this (Semaphore CI):
         commands:
           - source ./.semaphore/commands/install-cas.sh
           - cas pin .
+      - name: Audit
+        commands:
+          - source ./.semaphore/commands/install-cas.sh
+          - cas audit ./package-lock.json --whitelist ./auditjs.json --min-severity high
 ```
 
 `install-cas.sh` should pin cas by **literal SHA**, not via a
@@ -626,6 +762,7 @@ actual=$(cas --version | awk '{print $NF}')
 | `registry`    | every entry on an allowed host       | leaks detected (or `--fail-on-git` with any git-sourced) or load error    | —                                                         |
 | `scripts`     | every script-runner is allowlisted   | unallowlisted script-running entry found or load error                    | —                                                         |
 | `pin`         | every checked direct dep is pinned   | unpinned direct dep found, or `package.json` missing                      | —                                                         |
+| `audit`       | no vulnerabilities at or above `--min-severity` | vulnerability found, network error reaching OSV.dev, or load error | —                                                         |
 
 ---
 
