@@ -407,13 +407,7 @@ def drift_cmd(
         )
 
     click.echo(
-        "\nFix: re-run `npm install --package-lock-only --include=optional --force` and commit\n"
-        "the regenerated lockfile.\n"
-        "\n"
-        "  The `--force` flag is REQUIRED — without it, npm prunes every non-current-\n"
-        "  platform optional dep (e.g. `@nx/nx-linux-x64-gnu`, `@rollup/rollup-darwin-\n"
-        "  arm64`) and the Docker build / cross-platform CI breaks at install time.\n"
-        "  See npm/cli#4828 + #7961 — long-standing bug across npm 9, 10, 11.",
+        "\nFix: re-run `npm install --package-lock-only --include=optional --force` and commit the regenerated lockfile.",
         err=True,
     )
     sys.exit(1)
