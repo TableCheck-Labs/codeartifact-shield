@@ -139,6 +139,33 @@ def test_unresolved_entries_collected(tmp_path: Path) -> None:
     report = check_npm_registry(lf, [".d.codeartifact.us-east-1.amazonaws.com"])
     assert report.clean
     assert report.unresolved == ["node_modules/phantom"]
+    assert report.bundled == [], "phantom is not bundled — different classification"
+
+
+def test_bundled_entries_classified_separately_from_unresolved(tmp_path: Path) -> None:
+    """`inBundle: true` entries have no resolved URL by design — they must NOT
+    pollute the unresolved-phantoms bucket. Reviewers need to distinguish
+    legitimate bundleDependencies from suspicious phantom entries."""
+    lf = _write(
+        tmp_path,
+        {
+            "node_modules/parent": {
+                "version": "1.0.0",
+                "resolved": "https://acme-1234.d.codeartifact.us-east-1.amazonaws.com/-/parent-1.0.0.tgz",
+            },
+            "node_modules/parent/node_modules/bundled-child": {
+                "version": "2.0.0",
+                "inBundle": True,
+            },
+            "node_modules/dedupe-phantom": {"version": "3.0.0"},
+        },
+    )
+    report = check_npm_registry(lf, [".d.codeartifact.us-east-1.amazonaws.com"])
+    assert (
+        report.bundled
+        == ["node_modules/parent/node_modules/bundled-child"]
+    )
+    assert report.unresolved == ["node_modules/dedupe-phantom"]
 
 
 def test_empty_allowed_list_errors(tmp_path: Path) -> None:

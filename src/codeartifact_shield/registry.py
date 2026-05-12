@@ -41,7 +41,17 @@ class RegistryReport:
     """Workspace / local-path entries — neither a registry resolution nor a leak."""
 
     unresolved: list[str] = field(default_factory=list)
-    """Entries with no ``resolved`` field — usually deduped phantoms; can't be classified."""
+    """Entries with no ``resolved`` AND no ``inBundle: true`` — suspicious phantom
+    entries that have a version declaration but nothing telling npm where to get
+    the bytes. Most commonly dedupe artefacts; in a tampered lockfile they could
+    also be a sign someone removed a ``resolved`` URL hoping cas wouldn't notice."""
+
+    bundled: list[str] = field(default_factory=list)
+    """Entries flagged ``inBundle: true`` — bytes come from the parent's tarball
+    rather than a registry. Reported separately from ``unresolved`` so reviewers
+    can distinguish legitimate ``bundleDependencies`` from suspicious phantoms.
+    The SRI gate (``cas sri verify``) is what actually anchors these to the
+    parent's integrity hash."""
 
     @property
     def clean(self) -> bool:
@@ -123,7 +133,10 @@ def check_npm_registry(
             continue
         resolved = entry.get("resolved")
         if not resolved:
-            report.unresolved.append(key)
+            if entry.get("inBundle"):
+                report.bundled.append(key)
+            else:
+                report.unresolved.append(key)
             continue
         if resolved.startswith(("file:", "./", "../", "/")):
             report.file_sourced.append(key)
