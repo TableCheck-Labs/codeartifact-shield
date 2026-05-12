@@ -23,7 +23,7 @@ import click
 
 from codeartifact_shield import __version__
 from codeartifact_shield.drift import check_npm_drift
-from codeartifact_shield.registry import check_npm_registry
+from codeartifact_shield.registry import check_npm_registry, host_allowed
 from codeartifact_shield.sri import patch_lockfile, verify_lockfile
 
 logger = logging.getLogger(__name__)
@@ -215,9 +215,13 @@ def drift_cmd(frontend_dir: Path, ranges: bool, no_transitive: bool) -> None:
     required=True,
     envvar="CAS_ALLOWED_HOSTS",
     help=(
-        "Substring (case-insensitive) that an entry's resolved host must contain "
-        "to be considered legitimate. Repeatable. e.g. "
-        "`--allowed-host .d.codeartifact.`."
+        "Hostname suffix (case-insensitive, label-anchored) that an entry's "
+        "resolved host must equal or end with to be considered legitimate. "
+        "Repeatable. Use the FULL suffix — partial patterns like "
+        "`.d.codeartifact.` are no longer accepted because they let attacker-"
+        "controlled hosts of the form `evil.d.codeartifact.attacker.com` slip "
+        "through. e.g. "
+        "`--allowed-host .d.codeartifact.ap-northeast-1.amazonaws.com`."
     ),
 )
 @click.option(
@@ -247,7 +251,7 @@ def registry_cmd(
 
     click.echo("Resolved-host distribution:")
     for host, count in sorted(report.by_host.items(), key=lambda kv: -kv[1]):
-        marker = "OK" if any(p.lower() in host.lower() for p in allowed_hosts) else "LEAK"
+        marker = "OK" if host_allowed(host, allowed_hosts) else "LEAK"
         click.echo(f"  [{marker}] {host}: {count}")
     if report.mixed:
         click.echo("WARN — mixed registries: lockfile resolves from more than one host.")

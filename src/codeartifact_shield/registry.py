@@ -52,10 +52,40 @@ class RegistryReport:
         return len(self.by_host) > 1
 
 
-def _host_allowed(host: str, allowed: Iterable[str]) -> bool:
-    """Case-insensitive substring match. Empty allowed-list means *nothing* is allowed."""
-    host = host.lower()
-    return any(p.lower() in host for p in allowed)
+def host_allowed(host: str, allowed: Iterable[str]) -> bool:
+    """Label-anchored, case-insensitive hostname-suffix match.
+
+    A pattern matches a host iff the host *equals* the pattern (case-
+    insensitive) or *ends with ``.`` + the pattern*. Leading/trailing dots
+    in the pattern are stripped before comparison, so a user writing
+    ``.foo.example.com`` (a common convention for "any subdomain of") still
+    works as expected.
+
+    This is intentionally strict. Substring matching — which was the
+    previous behaviour — let an attacker-controlled host of the form
+    ``evil.<pattern-as-substring>.attacker.com`` pass an allowlist; any
+    pattern with internal dots (``.d.codeartifact.``) was vulnerable.
+    Patterns must now specify the full host suffix
+    (``.d.codeartifact.ap-northeast-1.amazonaws.com``), which gives the
+    same operational result on legitimate hosts while closing the
+    impersonation vector.
+
+    Empty allowed-list means *nothing* is allowed.
+    """
+    host = (host or "").lower().rstrip(".")
+    if not host:
+        return False
+    for pattern in allowed:
+        pat = (pattern or "").lower().strip(".")
+        if not pat:
+            continue
+        if host == pat or host.endswith("." + pat):
+            return True
+    return False
+
+
+# Back-compat alias for internal callers.
+_host_allowed = host_allowed
 
 
 def check_npm_registry(

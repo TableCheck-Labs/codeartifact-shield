@@ -34,7 +34,7 @@ def test_all_from_allowed_host_is_clean(tmp_path: Path) -> None:
             },
         },
     )
-    report = check_npm_registry(lf, [".d.codeartifact."])
+    report = check_npm_registry(lf, [".d.codeartifact.us-east-1.amazonaws.com"])
     assert report.clean
     assert not report.mixed
     assert report.by_host == {
@@ -56,7 +56,7 @@ def test_detects_public_registry_leak(tmp_path: Path) -> None:
             },
         },
     )
-    report = check_npm_registry(lf, [".d.codeartifact."])
+    report = check_npm_registry(lf, [".d.codeartifact.us-east-1.amazonaws.com"])
     assert not report.clean
     assert report.mixed
     assert report.leaked == [("node_modules/left-pad", "registry.npmjs.org")]
@@ -76,7 +76,7 @@ def test_multiple_allowed_hosts(tmp_path: Path) -> None:
             },
         },
     )
-    report = check_npm_registry(lf, [".d.codeartifact.", "internal-mirror.corp"])
+    report = check_npm_registry(lf, [".d.codeartifact.us-east-1.amazonaws.com", "internal-mirror.corp"])
     assert report.clean
     assert report.mixed  # two distinct hosts, both allowed
 
@@ -95,7 +95,7 @@ def test_git_sourced_classified_separately(tmp_path: Path) -> None:
             },
         },
     )
-    report = check_npm_registry(lf, [".d.codeartifact."])
+    report = check_npm_registry(lf, [".d.codeartifact.us-east-1.amazonaws.com"])
     # Git-sourced isn't a registry leak, but ``clean`` still returns False because
     # it's worth surfacing — they bypass the registry contract entirely.
     assert not report.clean
@@ -119,7 +119,7 @@ def test_file_workspace_links_ignored(tmp_path: Path) -> None:
             },
         },
     )
-    report = check_npm_registry(lf, [".d.codeartifact."])
+    report = check_npm_registry(lf, [".d.codeartifact.us-east-1.amazonaws.com"])
     assert report.clean
     assert report.file_sourced == ["node_modules/@local/scripts"]
 
@@ -136,7 +136,7 @@ def test_unresolved_entries_collected(tmp_path: Path) -> None:
             },
         },
     )
-    report = check_npm_registry(lf, [".d.codeartifact."])
+    report = check_npm_registry(lf, [".d.codeartifact.us-east-1.amazonaws.com"])
     assert report.clean
     assert report.unresolved == ["node_modules/phantom"]
 
@@ -151,7 +151,7 @@ def test_v1_lockfile_rejected(tmp_path: Path) -> None:
     lf = tmp_path / "package-lock.json"
     lf.write_text(json.dumps({"lockfileVersion": 1, "dependencies": {}}))
     with pytest.raises(ValueError, match="unsupported lockfileVersion"):
-        check_npm_registry(lf, [".d.codeartifact."])
+        check_npm_registry(lf, [".d.codeartifact.us-east-1.amazonaws.com"])
 
 
 def test_case_insensitive_host_match(tmp_path: Path) -> None:
@@ -164,5 +164,85 @@ def test_case_insensitive_host_match(tmp_path: Path) -> None:
             },
         },
     )
-    report = check_npm_registry(lf, [".d.codeartifact."])
+    report = check_npm_registry(lf, [".d.codeartifact.us-east-1.amazonaws.com"])
+    assert report.clean
+
+
+# ---------------------------------------------------------------------------
+# G3 — host matching must anchor at label boundaries, not as a substring.
+#
+# Threat model: substring match lets an attacker register
+# `evil.d.codeartifact.attacker.com` and resolve a leaked tarball through it;
+# the pattern `.d.codeartifact.` matches the substring, so cas would falsely
+# report "clean". The defense is label-aware suffix matching: host must
+# equal the pattern, or end with `.` + pattern.
+# ---------------------------------------------------------------------------
+
+
+def test_suffix_attack_host_not_allowed(tmp_path: Path) -> None:
+    """`evil.d.codeartifact.attacker.com` must NOT match a CA-host pattern."""
+    lf = _write(
+        tmp_path,
+        {
+            "node_modules/sneaky": {
+                "version": "1.0.0",
+                "resolved": "https://evil.d.codeartifact.attacker.com/npm/sneaky/-/sneaky-1.0.0.tgz",
+            },
+        },
+    )
+    report = check_npm_registry(
+        lf, [".d.codeartifact.ap-northeast-1.amazonaws.com"]
+    )
+    assert not report.clean, (
+        "host doesn't end with the legitimate suffix; must be flagged"
+    )
+    assert report.leaked == [
+        ("node_modules/sneaky", "evil.d.codeartifact.attacker.com")
+    ]
+
+
+def test_prefix_attack_host_not_allowed(tmp_path: Path) -> None:
+    """`legitimate-host.com.attacker.example` style must NOT match a suffix pattern."""
+    lf = _write(
+        tmp_path,
+        {
+            "node_modules/sneaky": {
+                "version": "1.0.0",
+                "resolved": "https://internal-mirror.corp.attacker.com/-/sneaky-1.0.0.tgz",
+            },
+        },
+    )
+    report = check_npm_registry(lf, ["internal-mirror.corp"])
+    assert not report.clean
+    assert report.leaked[0][0] == "node_modules/sneaky"
+
+
+def test_partial_label_not_allowed(tmp_path: Path) -> None:
+    """A pattern of `mirror.corp` must NOT match `badmirror.corp` (label boundary)."""
+    lf = _write(
+        tmp_path,
+        {
+            "node_modules/sneaky": {
+                "version": "1.0.0",
+                "resolved": "https://badmirror.corp/-/sneaky-1.0.0.tgz",
+            },
+        },
+    )
+    report = check_npm_registry(lf, ["mirror.corp"])
+    assert not report.clean
+    assert report.leaked[0][1] == "badmirror.corp"
+
+
+def test_exact_host_match_allowed(tmp_path: Path) -> None:
+    """An exact match between host and pattern is the strictest valid form."""
+    lf = _write(
+        tmp_path,
+        {
+            "node_modules/lodash": {
+                "version": "4.17.21",
+                "resolved": "https://internal-mirror.corp/-/lodash-4.17.21.tgz",
+            },
+        },
+    )
+    report = check_npm_registry(lf, ["internal-mirror.corp"])
     assert report.clean
