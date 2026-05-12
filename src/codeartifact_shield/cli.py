@@ -24,6 +24,7 @@ import click
 from codeartifact_shield import __version__
 from codeartifact_shield.drift import check_npm_drift
 from codeartifact_shield.registry import check_npm_registry, host_allowed
+from codeartifact_shield.scripts import check_install_scripts
 from codeartifact_shield.sri import patch_lockfile, verify_lockfile
 
 logger = logging.getLogger(__name__)
@@ -274,3 +275,64 @@ def registry_cmd(
 
     if report.leaked or (fail_on_git and report.git_sourced):
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# scripts — lifecycle-script (preinstall/install/postinstall) audit
+# ---------------------------------------------------------------------------
+
+
+@main.command("scripts")
+@click.argument("lockfile", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--allow",
+    "allowed",
+    multiple=True,
+    envvar="CAS_ALLOWED_SCRIPTS",
+    help=(
+        "Package name (including scope, e.g. `@parcel/watcher`) that is "
+        "permitted to run install scripts. Repeatable. Build-essential "
+        "native modules (esbuild, fsevents, etc.) typically need this — "
+        "review and allowlist deliberately."
+    ),
+)
+def scripts_cmd(lockfile: Path, allowed: tuple[str, ...]) -> None:
+    """Fail if any lockfile entry will run lifecycle scripts at install time.
+
+    Every dep with ``hasInstallScript: true`` gets to execute arbitrary code
+    when ``npm install`` runs — on a dev laptop or a CI runner. SRI binds
+    bytes to hashes but doesn't prevent a maintainer from deliberately
+    shipping a malicious ``postinstall``. This gate forces an explicit
+    allowlist instead of implicit trust.
+    """
+    report = check_install_scripts(lockfile, allowed=allowed)
+
+    if report.allowed:
+        click.echo(
+            f"Allowlisted script-running packages ({len(report.allowed)}):"
+        )
+        for f in report.allowed:
+            click.echo(f"  [OK] {f.package_name}@{f.version}")
+
+    if report.flagged:
+        click.echo(
+            f"\nPackages that will execute code at install time "
+            f"({len(report.flagged)}):",
+            err=True,
+        )
+        for f in report.flagged:
+            click.echo(
+                f"  [SCRIPT] {f.package_name}@{f.version}  ({f.lockfile_key})",
+                err=True,
+            )
+        click.echo(
+            "\nFix: audit each package's preinstall/install/postinstall "
+            "scripts. To allowlist, pass `--allow <package-name>` (repeat as "
+            "needed). To eliminate, run `npm ci --ignore-scripts` and replace "
+            "the dep.",
+            err=True,
+        )
+        sys.exit(1)
+
+    if not report.allowed:
+        click.echo("OK — no install scripts in the lockfile.")
