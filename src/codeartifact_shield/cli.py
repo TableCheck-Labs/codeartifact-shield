@@ -10,6 +10,8 @@ Five commands, single responsibility each:
 * ``cas registry`` — fail if any lockfile entry was resolved from a host
   other than the configured CodeArtifact / mirror, or via http://.
 * ``cas scripts`` — fail if any dep declares preinstall/install/postinstall.
+* ``cas pin`` — fail if any direct ``package.json`` dep declaration is a
+  range, dist-tag, or otherwise unpinned spec instead of an exact version.
 
 Designed to be dropped into a CI step; every command exits nonzero on a
 finding, and every command supports ``--json`` for machine-readable output.
@@ -32,6 +34,7 @@ from codeartifact_shield._output import (
     severity_counts,
 )
 from codeartifact_shield.drift import check_npm_drift
+from codeartifact_shield.pins import DEFAULT_SCOPES, check_pinning
 from codeartifact_shield.registry import check_npm_registry, host_allowed
 from codeartifact_shield.scripts import check_install_scripts
 from codeartifact_shield.sri import patch_lockfile, verify_lockfile
@@ -706,3 +709,171 @@ def scripts_cmd(
 
     if not report.allowed:
         click.echo("OK — no install scripts in the lockfile.")
+
+
+# ---------------------------------------------------------------------------
+# pin — direct-dep pinning policy audit (package.json)
+# ---------------------------------------------------------------------------
+
+
+@main.command("pin")
+@click.argument(
+    "project_dir", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
+@click.option(
+    "--allow",
+    "allowed",
+    multiple=True,
+    envvar="CAS_ALLOWED_UNPINNED",
+    help=(
+        "Package name (including scope) permitted to stay unpinned. "
+        "Repeatable. Every entry is a hole in the reproducibility "
+        "guarantee — review deliberately."
+    ),
+)
+@click.option(
+    "--scope",
+    "scopes",
+    multiple=True,
+    type=click.Choice(
+        [
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "peerDependencies",
+        ]
+    ),
+    help=(
+        "Limit the audit to specific package.json scopes. Repeatable. "
+        "Default: dependencies, devDependencies, optionalDependencies. "
+        "peerDependencies is excluded by default because peers are "
+        "idiomatically ranges; pass `--scope peerDependencies` to opt in."
+    ),
+)
+@click.option(
+    "--include-peer",
+    is_flag=True,
+    help=(
+        "Also audit `peerDependencies`. Equivalent to adding "
+        "`--scope peerDependencies` to the default scope set."
+    ),
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Emit a machine-readable JSON report on stdout instead of human text.",
+)
+def pin_cmd(
+    project_dir: Path,
+    allowed: tuple[str, ...],
+    scopes: tuple[str, ...],
+    include_peer: bool,
+    json_output: bool,
+) -> None:
+    """Fail if any direct dep in package.json isn't pinned to an exact version."""
+    scope_list = list(scopes) if scopes else list(DEFAULT_SCOPES)
+    try:
+        report = check_pinning(
+            project_dir,
+            allowed=allowed,
+            scopes=scope_list,
+            include_peer=include_peer,
+        )
+    except FileNotFoundError as exc:
+        if json_output:
+            emit_json(
+                {
+                    "command": "pin",
+                    "project_dir": str(project_dir),
+                    "clean": False,
+                    "findings": [
+                        {
+                            "severity": Severity.HIGH.value,
+                            "type": "missing_package_json",
+                            "message": str(exc),
+                        }
+                    ],
+                    "severity_counts": {Severity.HIGH.value: 1},
+                }
+            )
+        else:
+            click.echo(
+                f"{severity_badge(Severity.HIGH)} FAIL — {exc}", err=True
+            )
+        sys.exit(1)
+
+    findings: list[dict[str, Any]] = []
+    for f in report.flagged:
+        findings.append(
+            {
+                "severity": Severity.HIGH.value,
+                "type": "unpinned",
+                "scope": f.scope,
+                "package": f.package_name,
+                "declared": f.declared,
+                "kind": f.kind,
+            }
+        )
+    for f in report.allowed:
+        findings.append(
+            {
+                "severity": Severity.INFO.value,
+                "type": "unpinned_allowed",
+                "scope": f.scope,
+                "package": f.package_name,
+                "declared": f.declared,
+                "kind": f.kind,
+            }
+        )
+
+    effective_scopes = list(scope_list)
+    if include_peer and "peerDependencies" not in effective_scopes:
+        effective_scopes.append("peerDependencies")
+
+    if json_output:
+        emit_json(
+            {
+                "command": "pin",
+                "project_dir": str(project_dir),
+                "clean": report.clean,
+                "scopes": effective_scopes,
+                "total_checked": report.total_checked,
+                "findings": findings,
+                "severity_counts": severity_counts(findings),
+            }
+        )
+        if not report.clean:
+            sys.exit(1)
+        return
+
+    if report.allowed:
+        click.echo(f"Allowlisted unpinned deps ({len(report.allowed)}):")
+        for f in report.allowed:
+            click.echo(f"  [OK] {f.scope}: {f.package_name} = {f.declared} ({f.kind})")
+
+    if report.flagged:
+        click.echo(
+            f"\nUnpinned direct deps in package.json "
+            f"({len(report.flagged)} of {report.total_checked} checked):",
+            err=True,
+        )
+        for f in report.flagged:
+            click.echo(
+                f"  {severity_badge(Severity.HIGH)} {f.scope}: "
+                f"{f.package_name} = {f.declared}  ({f.kind})",
+                err=True,
+            )
+        click.echo(
+            "\nFix: replace each range/tag with the exact version currently "
+            "in package-lock.json. To allowlist (e.g. for a workspace-internal "
+            "tool with a stable API), pass `--allow <package-name>` "
+            "(repeat as needed).",
+            err=True,
+        )
+        sys.exit(1)
+
+    click.echo(
+        f"OK — all {report.total_checked} direct-dep declarations are pinned "
+        f"({', '.join(effective_scopes)})."
+    )

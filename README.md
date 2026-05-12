@@ -16,6 +16,10 @@ cas registry    fail when the lockfile resolves packages from a host
                 allowlist or auto-detect)
 cas scripts     fail when any lockfile entry will execute preinstall /
                 install / postinstall scripts at install time
+cas pin         fail when any direct package.json declaration is a
+                range (^1.2.3, ~1.2.3, >=1.0), dist-tag (latest, *),
+                tarball URL, file:/link: path, or git ref that isn't a
+                full 40-char commit SHA
 ```
 
 Every command:
@@ -424,6 +428,108 @@ deps.
 
 ---
 
+## `cas pin`
+
+Fail when any direct dep declaration in `package.json` isn't pinned to
+an exact version. The lockfile + SRI gates protect the bytes you've
+already approved; this gate protects what happens **next time someone
+runs `npm install`** (without `--frozen-lockfile`) or accepts a Renovate
+PR — that's when caret/tilde ranges silently widen the trust set to
+whatever version was published most recently.
+
+```
+cas pin [OPTIONS] PROJECT_DIR
+```
+
+`PROJECT_DIR` must contain a `package.json` at its root. A missing
+`package.json` exits `1` with a `[HIGH] FAIL — no package.json in
+<dir>` finding.
+
+| Flag                | Behavior                                                                                                                                                                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--allow TEXT`      | Package name (including scope, e.g. `@scope/name`) permitted to stay unpinned. Repeatable. Env: `CAS_ALLOWED_UNPINNED` (whitespace-separated). Use sparingly — every entry is a hole in the reproducibility guarantee.        |
+| `--scope CHOICE`    | Limit the audit to specific `package.json` buckets. Choices: `dependencies`, `devDependencies`, `optionalDependencies`, `peerDependencies`. Repeatable. Default: the first three (peer excluded by convention).               |
+| `--include-peer`    | Also audit `peerDependencies`. Equivalent to adding `--scope peerDependencies` to the default set.                                                                                                                            |
+| `--json`            | Machine-readable JSON on stdout instead of human text.                                                                                                                                                                        |
+| `-h`, `--help`      | Show help.                                                                                                                                                                                                                    |
+
+### What counts as pinned
+
+| Form                                              | Verdict | Notes                                                                       |
+| ------------------------------------------------- | ------- | --------------------------------------------------------------------------- |
+| `1.2.3`                                           | pinned  | Exact SemVer 2.0.0 — the only acceptable plain-string form.                 |
+| `1.2.3-rc.1`, `1.2.3+build.7`                     | pinned  | Prerelease and build metadata are allowed (still exact).                    |
+| `workspace:*`, `workspace:1.2.3`, `workspace:^`   | pinned  | Workspace protocol — resolved intra-monorepo, exempt.                       |
+| `npm:lodash@4.17.21`                              | pinned  | npm alias — the target spec is checked recursively (must itself be pinned). |
+| `git+https://github.com/x/y.git#<40-char SHA>`    | pinned  | Git URL with a full commit SHA fragment. Short SHAs and branch/tag refs are rejected. |
+| `github:user/repo#<40-char SHA>`, `user/repo#<40-char SHA>` | pinned | GitHub shorthand with a full commit SHA fragment.                  |
+| `^1.2.3`, `~1.2.3`, `>=1.0`, `1.2.x`, `1.x`, `*`  | **flagged** as `range`     | Any SemVer range operator.                          |
+| `latest`, dist-tags                               | **flagged** as `dist_tag`  | npm dist-tags resolve to whatever was published last. |
+| `file:../local-pkg`                               | **flagged** as `file`      | Local path — not content-addressed.                   |
+| `link:../symlinked`                               | **flagged** as `link`      | Local symlink — not content-addressed.                |
+| `https://example.com/x-1.0.0.tgz`                 | **flagged** as `tarball`   | Tarball URLs aren't content-addressed; the bytes at the URL can change. |
+| `git+...#main`, `git+...#abc1234` (short SHA)     | **flagged** as `git_ref`   | Branch/tag fragments and short SHAs aren't pinned.    |
+| Anything else                                     | **flagged** as `unknown`   | Unrecognized spec — treated as unsafe.                |
+
+### Severity
+
+Every flagged declaration is reported at **`HIGH`** severity (it's a
+direct hole in the project's reproducibility guarantee). Allowlisted
+declarations are surfaced at `INFO` so reviewers can see what the
+allowlist is letting through.
+
+### Examples
+
+```bash
+# Strict audit — every direct dep must be exact-pinned:
+cas pin .
+
+# Audit only production deps (skip devDependencies):
+cas pin . --scope dependencies --scope optionalDependencies
+
+# Also audit peerDependencies (uncommon — peers are idiomatically ranges):
+cas pin . --include-peer
+
+# Allowlist a known-stable internal tool:
+cas pin . --allow @internal/cli-tool
+
+# Machine-readable for CI dashboards:
+cas pin . --json | jq '.findings[] | select(.severity == "HIGH")'
+```
+
+### JSON schema
+
+```json
+{
+  "command": "pin",
+  "project_dir": "/path/to/project",
+  "clean": false,
+  "scopes": ["dependencies", "devDependencies", "optionalDependencies"],
+  "total_checked": 124,
+  "findings": [
+    {
+      "severity": "HIGH",
+      "type": "unpinned",
+      "scope": "dependencies",
+      "package": "react",
+      "declared": "^18.0.0",
+      "kind": "range"
+    },
+    {
+      "severity": "INFO",
+      "type": "unpinned_allowed",
+      "scope": "devDependencies",
+      "package": "@internal/cli-tool",
+      "declared": "^2.0.0",
+      "kind": "range"
+    }
+  ],
+  "severity_counts": {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 0, "LOW": 0, "INFO": 1}
+}
+```
+
+---
+
 ## Lockfile structure validation
 
 Every command refuses to operate on a structurally-suspect lockfile
@@ -450,6 +556,7 @@ the check is consistent everywhere.
 | `CAS_REPOSITORY`          | `cas sri patch`      | Default for `--repository`.                                 |
 | `CAS_ALLOWED_HOSTS`       | `cas registry`       | Whitespace-separated default for `--allowed-host`.          |
 | `CAS_ALLOWED_SCRIPTS`     | `cas scripts`        | Whitespace-separated default for `--allow`.                 |
+| `CAS_ALLOWED_UNPINNED`    | `cas pin`            | Whitespace-separated default for `--allow`.                 |
 | Standard `AWS_*`          | `cas sri patch`      | Picked up by boto3 for CodeArtifact API auth.               |
 
 ---
@@ -484,6 +591,10 @@ A complete gate looks like this (Semaphore CI):
         commands:
           - source ./.semaphore/commands/install-cas.sh
           - cas scripts ./package-lock.json --allow esbuild --allow fsevents
+      - name: Pin Policy
+        commands:
+          - source ./.semaphore/commands/install-cas.sh
+          - cas pin .
 ```
 
 `install-cas.sh` should pin cas by **literal SHA**, not via a
@@ -514,6 +625,7 @@ actual=$(cas --version | awk '{print $NF}')
 | `sri verify`  | coverage ≥ threshold                 | coverage below threshold or unsupported lockfile                          | —                                                         |
 | `registry`    | every entry on an allowed host       | leaks detected (or `--fail-on-git` with any git-sourced) or load error    | —                                                         |
 | `scripts`     | every script-runner is allowlisted   | unallowlisted script-running entry found or load error                    | —                                                         |
+| `pin`         | every checked direct dep is pinned   | unpinned direct dep found, or `package.json` missing                      | —                                                         |
 
 ---
 

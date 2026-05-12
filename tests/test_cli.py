@@ -346,3 +346,117 @@ def test_json_output_is_parseable(tmp_path: Path) -> None:
         ],
     )
     json.loads(result.stdout)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# pin — direct-dep pinning policy audit
+# ---------------------------------------------------------------------------
+
+
+def _write_pkg_only(tmp_path: Path, content: dict[str, object]) -> Path:
+    (tmp_path / "package.json").write_text(json.dumps(content))
+    return tmp_path
+
+
+def test_pin_clean_exits_zero(tmp_path: Path) -> None:
+    project = _write_pkg_only(
+        tmp_path,
+        {"dependencies": {"a": "1.2.3"}, "devDependencies": {"b": "2.0.0"}},
+    )
+    result = CliRunner().invoke(main, ["pin", str(project)])
+    assert result.exit_code == 0
+    assert "OK" in result.stdout
+
+
+def test_pin_flagged_exits_one_and_tagged_high(tmp_path: Path) -> None:
+    project = _write_pkg_only(
+        tmp_path, {"dependencies": {"a": "^1.0.0"}}
+    )
+    result = CliRunner().invoke(main, ["pin", str(project)])
+    assert result.exit_code == 1
+    assert "[HIGH]" in result.stderr
+    assert "a = ^1.0.0" in result.stderr
+
+
+def test_pin_json_output_structure(tmp_path: Path) -> None:
+    project = _write_pkg_only(
+        tmp_path,
+        {
+            "dependencies": {"a": "^1.0.0", "b": "1.0.0"},
+            "devDependencies": {"c": "latest"},
+        },
+    )
+    result = CliRunner().invoke(main, ["pin", str(project), "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["command"] == "pin"
+    assert payload["total_checked"] == 3
+    assert payload["clean"] is False
+    unpinned = [f for f in payload["findings"] if f["type"] == "unpinned"]
+    assert {f["package"] for f in unpinned} == {"a", "c"}
+    kinds = {f["package"]: f["kind"] for f in unpinned}
+    assert kinds["a"] == "range"
+    assert kinds["c"] == "dist_tag"
+    assert payload["severity_counts"]["HIGH"] == 2
+
+
+def test_pin_allowlist_via_flag(tmp_path: Path) -> None:
+    project = _write_pkg_only(
+        tmp_path, {"dependencies": {"a": "^1.0.0", "b": "^2.0.0"}}
+    )
+    result = CliRunner().invoke(
+        main, ["pin", str(project), "--allow", "a", "--json"]
+    )
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    # `a` should be INFO (allowed), `b` should be HIGH (flagged).
+    by_pkg = {f["package"]: f for f in payload["findings"]}
+    assert by_pkg["a"]["type"] == "unpinned_allowed"
+    assert by_pkg["a"]["severity"] == "INFO"
+    assert by_pkg["b"]["type"] == "unpinned"
+    assert by_pkg["b"]["severity"] == "HIGH"
+
+
+def test_pin_scope_flag_narrows_audit(tmp_path: Path) -> None:
+    project = _write_pkg_only(
+        tmp_path,
+        {
+            "dependencies": {"a": "^1.0.0"},
+            "devDependencies": {"b": "^2.0.0"},
+        },
+    )
+    result = CliRunner().invoke(
+        main, ["pin", str(project), "--scope", "dependencies", "--json"]
+    )
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["scopes"] == ["dependencies"]
+    assert payload["total_checked"] == 1
+    flagged_pkgs = {f["package"] for f in payload["findings"]}
+    assert flagged_pkgs == {"a"}
+
+
+def test_pin_include_peer_flag(tmp_path: Path) -> None:
+    project = _write_pkg_only(
+        tmp_path,
+        {
+            "dependencies": {"a": "1.0.0"},
+            "peerDependencies": {"react": "^18.0.0"},
+        },
+    )
+    result = CliRunner().invoke(
+        main, ["pin", str(project), "--include-peer", "--json"]
+    )
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert "peerDependencies" in payload["scopes"]
+    finding = next(f for f in payload["findings"] if f["package"] == "react")
+    assert finding["scope"] == "peerDependencies"
+
+
+def test_pin_missing_package_json_clean_error(tmp_path: Path) -> None:
+    result = CliRunner().invoke(main, ["pin", str(tmp_path), "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["findings"][0]["type"] == "missing_package_json"
+    assert payload["findings"][0]["severity"] == "HIGH"
