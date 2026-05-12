@@ -270,6 +270,15 @@ def patch_lockfile(
         if entry.get("integrity"):
             report.already_present += 1
             continue
+        if entry.get("inBundle"):
+            # bundleDependencies: the standalone hash CA returns for this
+            # package@version describes the *registry* publication, not the
+            # bytes the parent author bundled into their tarball. Injecting
+            # it here would write a wrong-but-plausible hash that npm never
+            # actually checks at install time (bundled bytes come from the
+            # parent's tarball, which has its own integrity). Skip; the
+            # parent's hash is the legitimate trust root, enforced by verify.
+            continue
         ref = _ref_from_lockfile_key(key)
         if ref is None:
             continue

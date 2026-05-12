@@ -344,3 +344,60 @@ def test_verify_inBundle_at_top_level_uncovered(tmp_path: Path) -> None:
     covered, total = verify_lockfile(lockfile)
     assert total == 1
     assert covered == 0, "top-level inBundle has no parent to anchor to"
+
+
+# ---------------------------------------------------------------------------
+# G2 — patch must NOT inject a standalone hash for bundled entries.
+#
+# The hash CodeArtifact stores for is-unicode-supported@1.3.0 (a standalone
+# publication) only equals the bytes inside @clack/prompts@0.6.3's tarball
+# by coincidence — a parent author could have modified the bundled package
+# at publish time. Writing the standalone hash would create false confidence:
+# `npm ci` doesn't verify bundled bytes against any hash, so the wrong
+# integrity value would silently pass install while misleading auditors.
+# ---------------------------------------------------------------------------
+
+
+def test_patch_lockfile_skips_bundled_entries(tmp_path: Path) -> None:
+    """A bundled entry must not have integrity injected from CA."""
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text(
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/parent": {
+                        "version": "1.0.0",
+                        "resolved": "https://r/parent.tgz",
+                        "integrity": _VALID_SRI,
+                    },
+                    "node_modules/parent/node_modules/bundled-child": {
+                        "version": "2.0.0",
+                        "inBundle": True,
+                    },
+                },
+            }
+        )
+    )
+
+    # The fake client WOULD return a hash for bundled-child if asked, which
+    # would be wrong to inject — so the test asserts we never asked.
+    client = _fake_client({("bundled-child", "2.0.0", None): "b" * 128})
+
+    report = patch_lockfile(
+        lockfile,
+        domain="d",
+        repository="r",
+        boto3_session=_fake_session(client),
+    )
+
+    assert report.patched == 0, "no bundled entry should be patched"
+    written = json.loads(lockfile.read_text())
+    assert (
+        "integrity"
+        not in written["packages"]["node_modules/parent/node_modules/bundled-child"]
+    ), "bundled entry must not have a fabricated standalone hash injected"
+    # And we must not have made a CA API call for the bundled entry.
+    assert client.list_package_version_assets.call_count == 0, (
+        "patch should skip bundled entries without touching CodeArtifact"
+    )
