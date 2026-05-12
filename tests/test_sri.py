@@ -358,6 +358,108 @@ def test_verify_inBundle_at_top_level_uncovered(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# G7 — SRI algorithm strength. SHA-1 is cryptographically broken (SHA-1 was
+# removed from the SRI spec years ago). An entry whose only `integrity` is
+# `sha1-...` must not be counted as covered, and `patch` must upgrade it.
+# Acceptable algorithms: sha256, sha384, sha512 (npm's modern default).
+# ---------------------------------------------------------------------------
+
+_WEAK_SRI_SHA1 = "sha1-" + ("a" * 27) + "="  # 20-byte SHA-1, base64 ~28 chars
+_STRONG_SRI_SHA256 = "sha256-" + ("a" * 43) + "="  # 32-byte SHA-256
+_STRONG_SRI_SHA384 = "sha384-" + ("a" * 64)  # 48-byte SHA-384
+_STRONG_SRI_SHA512 = "sha512-" + ("a" * 86) + "=="
+
+
+def test_verify_treats_sha1_integrity_as_missing(tmp_path: Path) -> None:
+    """`sha1-...` is collision-broken and not in modern SRI spec — fail closed."""
+    lockfile = _write_lock(
+        tmp_path,
+        {
+            "node_modules/legacy": {
+                "version": "1.0.0",
+                "resolved": "https://r/legacy.tgz",
+                "integrity": _WEAK_SRI_SHA1,
+            },
+        },
+    )
+    covered, total = verify_lockfile(lockfile)
+    assert total == 1
+    assert covered == 0, "sha1 must not count as covered"
+
+
+def test_verify_accepts_sha256_sha384_sha512(tmp_path: Path) -> None:
+    lockfile = _write_lock(
+        tmp_path,
+        {
+            "node_modules/a": {
+                "version": "1.0.0",
+                "resolved": "https://r/a.tgz",
+                "integrity": _STRONG_SRI_SHA256,
+            },
+            "node_modules/b": {
+                "version": "1.0.0",
+                "resolved": "https://r/b.tgz",
+                "integrity": _STRONG_SRI_SHA384,
+            },
+            "node_modules/c": {
+                "version": "1.0.0",
+                "resolved": "https://r/c.tgz",
+                "integrity": _STRONG_SRI_SHA512,
+            },
+        },
+    )
+    covered, total = verify_lockfile(lockfile)
+    assert (covered, total) == (3, 3)
+
+
+def test_verify_accepts_mixed_when_at_least_one_is_strong(tmp_path: Path) -> None:
+    """SRI strings can be space-separated; if any algorithm is strong, the entry is covered."""
+    lockfile = _write_lock(
+        tmp_path,
+        {
+            "node_modules/upgraded": {
+                "version": "1.0.0",
+                "resolved": "https://r/upgraded.tgz",
+                "integrity": f"{_WEAK_SRI_SHA1} {_STRONG_SRI_SHA512}",
+            },
+        },
+    )
+    covered, total = verify_lockfile(lockfile)
+    assert (covered, total) == (1, 1)
+
+
+def test_patch_upgrades_weak_sha1_integrity_to_sha512(tmp_path: Path) -> None:
+    """A lockfile with sha1 must be patched to sha512 by `cas sri patch`."""
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text(
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/legacy": {
+                        "version": "1.0.0",
+                        "resolved": "https://r/legacy.tgz",
+                        "integrity": _WEAK_SRI_SHA1,
+                    },
+                },
+            }
+        )
+    )
+    client = _fake_client({("legacy", "1.0.0", None): "f" * 128})
+    report = patch_lockfile(
+        lockfile,
+        domain="d",
+        repository="r",
+        boto3_session=_fake_session(client),
+    )
+    assert report.patched == 1
+    written = json.loads(lockfile.read_text())
+    new_integrity = written["packages"]["node_modules/legacy"]["integrity"]
+    assert new_integrity.startswith("sha512-")
+    assert "sha1-" not in new_integrity
+
+
 def test_patch_lockfile_skips_bundled_entries(tmp_path: Path) -> None:
     """A bundled entry must not have integrity injected from CA."""
     lockfile = tmp_path / "package-lock.json"

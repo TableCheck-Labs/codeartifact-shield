@@ -133,6 +133,30 @@ def _iter_lockfile_packages(lock: dict[str, Any]) -> Iterable[tuple[str, dict[st
         yield key, entry
 
 
+_STRONG_SRI_ALGORITHMS = frozenset({"sha256", "sha384", "sha512"})
+
+
+def _has_strong_integrity(entry: dict[str, Any]) -> bool:
+    """True iff the entry has at least one SRI value using a non-broken algorithm.
+
+    SRI strings may carry multiple space-separated values (the spec allows
+    this for algorithm-agility / upgrade periods). If ANY of them is sha256/
+    sha384/sha512, the entry is considered covered. SHA-1 alone does not
+    count — it's collision-broken and was removed from the modern SRI spec.
+
+    The bare ``integrity`` field is a string; older or hand-rolled lockfiles
+    might carry a non-string value. Defensive against that.
+    """
+    integrity = entry.get("integrity")
+    if not isinstance(integrity, str) or not integrity:
+        return False
+    for part in integrity.split():
+        algo, sep, _ = part.partition("-")
+        if sep and algo.lower() in _STRONG_SRI_ALGORITHMS:
+            return True
+    return False
+
+
 def _parent_lockfile_key(key: str) -> str | None:
     """Return the parent lockfile key for a nested ``node_modules`` path.
 
@@ -173,7 +197,7 @@ def _is_integrity_covered(
     arranging a parent whose hash anchors the real ``bundleDependencies``
     list — and forging that hash would require breaking SHA-512.
     """
-    if entry.get("integrity"):
+    if _has_strong_integrity(entry):
         return True
     if not entry.get("inBundle"):
         return False
@@ -264,7 +288,7 @@ def patch_lockfile(
 
     report = PatchReport()
     for key, entry in _iter_lockfile_packages(lock):
-        if entry.get("integrity"):
+        if _has_strong_integrity(entry):
             report.already_present += 1
             continue
         if entry.get("inBundle"):
