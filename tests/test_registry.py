@@ -246,3 +246,46 @@ def test_exact_host_match_allowed(tmp_path: Path) -> None:
     )
     report = check_npm_registry(lf, ["internal-mirror.corp"])
     assert report.clean
+
+
+# ---------------------------------------------------------------------------
+# G4 — resolved URLs must be HTTPS. http:// is MITM-able on any
+# untrusted hop between dev/CI and the registry, and there's no legitimate
+# reason for a modern lockfile entry to use it.
+# ---------------------------------------------------------------------------
+
+
+def test_http_resolved_url_is_leaked_even_with_allowed_host(tmp_path: Path) -> None:
+    """`http://allowed.host/...` must fail — host allowlist doesn't help against MITM."""
+    lf = _write(
+        tmp_path,
+        {
+            "node_modules/sneaky": {
+                "version": "1.0.0",
+                "resolved": "http://acme-1234.d.codeartifact.us-east-1.amazonaws.com/npm/sneaky/-/sneaky-1.0.0.tgz",
+            },
+        },
+    )
+    report = check_npm_registry(lf, [".d.codeartifact.us-east-1.amazonaws.com"])
+    assert not report.clean
+    assert report.leaked, "http:// must be classified as leaked"
+    # The host is in the allowlist, but the scheme isn't — record the host
+    # so the reviewer can see exactly what changed.
+    assert report.leaked[0][0] == "node_modules/sneaky"
+
+
+def test_unknown_scheme_resolved_url_is_leaked(tmp_path: Path) -> None:
+    """ftp://, ws://, etc. — anything that's not https:// (or one of the
+    explicitly-classified git+/file:/link: schemes) is treated as leaked."""
+    lf = _write(
+        tmp_path,
+        {
+            "node_modules/sneaky": {
+                "version": "1.0.0",
+                "resolved": "ftp://acme-1234.d.codeartifact.us-east-1.amazonaws.com/sneaky.tgz",
+            },
+        },
+    )
+    report = check_npm_registry(lf, [".d.codeartifact.us-east-1.amazonaws.com"])
+    assert not report.clean
+    assert report.leaked, "ftp:// must be classified as leaked"

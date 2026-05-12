@@ -138,7 +138,14 @@ def check_npm_registry(
         parsed = urlparse(resolved)
         host = parsed.hostname or "(unknown)"
         report.by_host[host] = report.by_host.get(host, 0) + 1
-        if not _host_allowed(host, allowed):
+        # Enforce https://. http:// is MITM-able on any untrusted hop between
+        # the install machine and the registry; other schemes (ftp://, ws://,
+        # etc.) have no legitimate place in a modern lockfile entry. Treat
+        # the entry as leaked with a scheme tag so reviewers can see why.
+        if parsed.scheme != "https":
+            report.leaked.append((key, f"{host} (insecure scheme: {parsed.scheme}://)"))
+            continue
+        if not host_allowed(host, allowed):
             report.leaked.append((key, host))
 
     return report
