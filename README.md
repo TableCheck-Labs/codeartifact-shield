@@ -1,35 +1,69 @@
 # codeartifact-shield
 
-npm supply-chain hardening for projects that proxy through **AWS CodeArtifact**.
+npm supply-chain hardening for projects that proxy through **AWS CodeArtifact**
+(or use any internal registry, or stay on public npm — every command works for
+all three).
 
 ```
-cas drift       fail on package.json / package-lock.json disagreement (direct + transitive + orphans)
-cas sri patch   backfill the SRI integrity hashes CodeArtifact strips from npm metadata
-cas sri verify  fail when SRI coverage drops below threshold (sha256+ required; sha1 rejected)
-cas registry    fail when the lockfile resolves packages from a non-allowed host (label-anchored)
-cas scripts     fail when any lockfile entry will execute lifecycle scripts at install time
+cas drift       fail on package.json / package-lock.json disagreement
+                (direct + transitive + orphan-entry detection)
+cas sri patch   backfill the SRI integrity hashes CodeArtifact strips
+                from npm-format metadata responses
+cas sri verify  fail when integrity coverage drops below threshold
+                (sha256/sha384/sha512 required; sha1 rejected)
+cas registry    fail when the lockfile resolves packages from a host
+                that isn't the project's primary registry (label-anchored
+                allowlist or auto-detect)
+cas scripts     fail when any lockfile entry will execute preinstall /
+                install / postinstall scripts at install time
 ```
+
+Every command:
+* exits **nonzero** on a finding, so it drops straight into a CI gate;
+* supports `--json` for SARIF / GitHub Code Scanning / dashboard ingestion;
+* prefixes finding lines with `[CRITICAL]` / `[HIGH]` / `[MEDIUM]` / `[LOW]` /
+  `[INFO]` so reviewers can triage when several gates fail in the same run;
+* refuses to operate on a structurally-suspect lockfile (path-traversal in
+  package keys, malformed grammar, unsupported v1 format) with a clean
+  `[HIGH] FAIL` line — never a Python traceback.
+
+---
+
+## What changed in v0.4.0
+
+* **`cas registry` auto-detects the project's primary registry** when
+  `--allowed-host` is omitted. Reads the lockfile's `resolved` URL
+  distribution and treats every host carrying ≥20% of the top host's entry
+  count as primary. A 100%-CodeArtifact lockfile, a 100%-public-npm
+  lockfile, a CodeArtifact + corporate-mirror mix — all three pass cleanly.
+  One-off anomalies (the dependency-confusion attack signature) still fall
+  below the threshold and are flagged as CRITICAL. Strict mode (with one
+  or more `--allowed-host` flags) is **unchanged**.
+* **v1-lockfile traceback fix.** `cas drift` / `cas registry` /
+  `cas scripts` now catch the unsupported-format `ValueError` from the
+  lockfile loader and emit a clean `[HIGH] FAIL — unsupported
+  lockfileVersion 1` instead of a Python stack trace. Discovered during an
+  org-wide sweep that crashed on 18 npm-6-era archive repos.
+* `RegistryReport.detected_primary_hosts: list[str]` surfaces in both
+  human and JSON output when auto-detect is active.
 
 ## What changed in v0.3.0
 
-- **Severity badges in human output.** Every finding line gets a
-  `[CRITICAL]` / `[HIGH]` / `[MEDIUM]` / `[LOW]` / `[INFO]` prefix so
-  reviewers can triage when multiple gates fail in the same CI run.
-  Severities reflect blast radius (see table below), not finding count.
-- **`--json` flag on every subcommand.** Emits a stable, parseable schema
-  on stdout for downstream consumption (SARIF conversion, GitHub Code
-  Scanning, custom dashboards). Human-readable output continues to be
-  available without the flag.
+* **Severity badges in human output.** Every finding line gets a
+  `[CRITICAL]` / `[HIGH]` / `[MEDIUM]` / `[LOW]` / `[INFO]` prefix.
+  Severities reflect blast radius (see the table below), not finding count.
+* **`--json` flag on every subcommand.** Emits a stable, parseable schema
+  on stdout for downstream consumption.
 
 ### Severity ladder
 
-| Severity | Type                                  | Meaning                                                    |
-| -------- | ------------------------------------- | ---------------------------------------------------------- |
-| CRITICAL | `registry_leak`, `insecure_scheme`    | Active route to untrusted bytes at next `npm install`      |
-| HIGH     | `direct_drift`, `transitive_drift`, `orphan_entry`, `install_script`, `sri_coverage_below_threshold` | Tampering signature, pending RCE, or missing integrity    |
-| MEDIUM   | `git_sourced`                         | Bypasses the registry contract (content-pinned to commit)  |
-| LOW      | `unresolved_phantom`                  | Suspicious-but-explainable lockfile entry                  |
-| INFO     | `bundled`, `install_script_allowed`   | Context only, not a failure                                |
+| Severity | Type                                  | Meaning                                                        |
+| -------- | ------------------------------------- | -------------------------------------------------------------- |
+| CRITICAL | `registry_leak`, insecure scheme on a `resolved` URL | Active route to untrusted bytes at next `npm install`   |
+| HIGH     | `direct_drift`, `transitive_drift`, `orphan_entry`, `install_script`, `sri_coverage_below_threshold`, `lockfile_load_error` | Tampering signature, pending RCE, or missing integrity  |
+| MEDIUM   | `git_sourced`                         | Bypasses the registry contract (content-pinned to commit)      |
+| LOW      | `unresolved_phantom`                  | Suspicious-but-explainable lockfile entry                      |
+| INFO     | `bundled`, `install_script_allowed`   | Context only, not a failure                                    |
 
 ### `--json` output schema
 
@@ -38,294 +72,520 @@ cas scripts     fail when any lockfile entry will execute lifecycle scripts at i
   "command": "registry",
   "lockfile": "/path/to/package-lock.json",
   "clean": false,
+  "by_host": {"acme-1.d.codeartifact.us-east-1.amazonaws.com": 2790, "registry.npmjs.org": 1},
+  "mixed_registries": true,
+  "detected_primary_hosts": ["acme-1.d.codeartifact.us-east-1.amazonaws.com"],
+  "auto_detect": true,
   "findings": [
-    {"severity": "CRITICAL", "type": "registry_leak", "lockfile_key": "...", "host": "..."}
+    {"severity": "CRITICAL", "type": "registry_leak", "lockfile_key": "node_modules/sneaky", "host": "registry.npmjs.org"}
   ],
   "severity_counts": {"CRITICAL": 1, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
 }
 ```
 
-Exit code is still 1 on any failure-tier finding; `--json` does not change
-gating, only the output format. All human-readable lines (banner text,
-warnings) are routed to stderr in `--json` mode so stdout remains a clean
-JSON document for piping into `jq` / SARIF converters.
+Exit code is still `1` on any failure-tier finding; `--json` only changes
+the output format. All human banner text in `--json` mode is routed to
+stderr so stdout remains a clean JSON document for piping into `jq` or
+SARIF converters.
 
 ## What changed in v0.2.0
 
 Security-driven changes; **some are breaking**. Review before upgrading.
 
-- **`cas registry` is label-anchored, not substring.** A pattern like
+* **`cas registry` is label-anchored, not substring.** A pattern like
   `.d.codeartifact.` used to substring-match anything containing those
   characters — including attacker-controlled hosts of the form
   `evil.d.codeartifact.attacker.com`. Patterns now match at hostname-label
   boundaries: a host must *equal* the pattern or *end with* `.` + the pattern.
-  Update existing config from `.d.codeartifact.` to the full suffix
-  `.d.codeartifact.<region>.amazonaws.com`.
-- **`cas registry` requires HTTPS.** A `resolved` URL using `http://`,
-  `ftp://`, or any non-https scheme is treated as leaked, even if the host
-  is in the allowlist.
-- **`cas sri verify` rejects sha1 integrity.** SHA-1 is collision-broken and
+* **`cas registry` requires HTTPS.** A `resolved` URL using `http://`,
+  `ftp://`, or any non-https scheme is treated as a CRITICAL leak even if
+  the host is in the allowlist.
+* **`cas sri verify` rejects sha1 integrity.** SHA-1 is collision-broken and
   was removed from the modern SRI spec. Lockfile entries whose only integrity
   is `sha1-…` count as missing; `cas sri patch` overwrites them with sha512
   from CodeArtifact.
-- **`cas sri verify` correctly handles `bundleDependencies`.** Bundled
-  entries are now counted in the denominator AND credited to their parent's
-  integrity hash. A 100% threshold is again honestly reachable; an
-  orphan-bundled entry (parent has no integrity) fails closed.
-- **`cas drift` detects orphan lockfile entries** that no `package.json`
-  (root or transitive) declares — the most plausible footprint of a
-  malicious lockfile insertion.
-- **`cas scripts` is new.** Fails the build on any lockfile entry whose
-  `hasInstallScript: true` (i.e., will run `preinstall`/`install`/
-  `postinstall` at `npm install` time). Allowlist the build-essentials
-  you need via `--allow <package>`.
-- **Lockfile path-traversal validation.** Every subcommand refuses to
+* **`cas sri verify` correctly handles `bundleDependencies`.** Bundled
+  entries (`inBundle: true`) are counted in the denominator AND credited
+  to their parent's integrity hash. A 100% threshold is honestly reachable;
+  an orphan-bundled entry (parent has no integrity) fails closed.
+* **`cas drift` detects orphan lockfile entries** unreachable from any
+  `package.json` declaration (root or transitive) — the most plausible
+  footprint of a malicious lockfile insertion.
+* **`cas scripts` is new.**
+* **Lockfile path-traversal validation.** Every subcommand refuses to
   operate on a lockfile whose package keys contain `..`, leading `/`,
-  null bytes, or other malformed path segments.
+  backslashes, or null bytes.
 
 ## Why this exists
 
-AWS CodeArtifact's npm proxy is a great supply-chain mitigation in theory: pin every
-install through one repository, gate ingestion with internal policy, audit who pulled
-what. In practice three gaps slip past it:
+AWS CodeArtifact's npm proxy is a great supply-chain mitigation in theory:
+pin every install through one repository, gate ingestion with internal
+policy, audit who pulled what. In practice three gaps slip past it:
 
-1. **CodeArtifact strips `dist.integrity`.** Its npm-format metadata response
-   omits the integrity field, so every `package-lock.json` entry written through
-   the proxy comes out without an SRI hash. `npm ci` then version-pins without
-   content-pinning — it installs whatever bytes the registry currently returns.
-2. **The lockfile silently drifts from `package.json`.** A bad merge, a partial
-   regeneration, or deliberate tampering can leave declared and resolved
-   versions inconsistent. The threat is small bumps you'd never notice in
-   review.
-3. **Public-registry leakage.** It only takes one stray `resolved` URL pointing
-   at `registry.npmjs.org` for the CodeArtifact contract to break — and that
-   one entry is exactly where a dependency-confusion attack would land.
+1. **CodeArtifact strips `dist.integrity`.** Its npm-format metadata
+   response omits the integrity field, so every `package-lock.json` entry
+   written through the proxy comes out without an SRI hash. `npm ci` then
+   version-pins without content-pinning — it installs whatever bytes the
+   registry currently returns.
+2. **The lockfile silently drifts from `package.json`.** A bad merge, a
+   partial regeneration, or deliberate tampering can leave declared and
+   resolved versions inconsistent. The threat is small bumps you'd never
+   notice in review.
+3. **Public-registry leakage.** It only takes one stray `resolved` URL
+   pointing at `registry.npmjs.org` for the CodeArtifact contract to
+   break — and that one entry is exactly where a dependency-confusion
+   attack would land.
 
-`codeartifact-shield` closes all three in a CLI you drop into CI.
+`cas` closes all three plus a fourth — lifecycle scripts — in a CLI you
+drop into CI.
 
 ## Install
 
-The package isn't on PyPI yet. Install directly from GitHub:
+The package isn't on PyPI. Install directly from GitHub, **pinned to a
+specific commit SHA**:
 
 ```bash
-pip install "git+https://github.com/alexandernicholson/codeartifact-shield.git"
+pip install "git+https://github.com/TableCheck-Labs/codeartifact-shield.git@<sha>"
 ```
 
-…or clone and install editable for development:
+Floating refs (`@main`, `@v0.4.0` as a tag) are technically supported but
+should not be used in CI: tags can be force-pushed, branches change over
+time. The threat model is "the trust root of your supply-chain scanner is
+itself supply-chain-controllable" — so always pin to a full SHA. Find the
+SHA matching a tag at the [releases page](https://github.com/TableCheck-Labs/codeartifact-shield/releases).
+
+For development:
 
 ```bash
-git clone https://github.com/alexandernicholson/codeartifact-shield.git
+git clone https://github.com/TableCheck-Labs/codeartifact-shield.git
 cd codeartifact-shield
 pip install -e ".[dev]"
 ```
 
-Requires Python 3.10+. The two entry points `cas` and `codeartifact-shield`
+Requires Python 3.10+. The entry points `cas` and `codeartifact-shield`
 are equivalent.
 
 ## Quickstart
 
-For a typical setup (CodeArtifact as the only intended registry):
-
 ```bash
-# 1. Make sure declared and resolved versions agree, including transitives.
+# Direct + transitive + orphan drift check.
 cas drift ./frontend
 
-# 2. Make sure every lockfile entry has an SRI hash.
+# Auto-detect primary registry — works for CA, public-npm, or mixed repos.
+cas registry ./frontend/package-lock.json
+
+# Or be explicit (strict): every entry must be on this CA host.
+cas registry ./frontend/package-lock.json \
+  --allowed-host '.d.codeartifact.ap-northeast-1.amazonaws.com'
+
+# 100% integrity coverage required.
 cas sri verify ./frontend/package-lock.json --min-coverage 100
 
-# 3. Make sure no entry was resolved from a non-CodeArtifact host.
-cas registry ./frontend/package-lock.json --allowed-host '.d.codeartifact.'
+# Every install-script-running dep must be on the allowlist.
+cas scripts ./frontend/package-lock.json \
+  --allow esbuild --allow fsevents --allow @parcel/watcher
 ```
 
-Each command exits nonzero on a finding, so it's directly usable as a CI gate.
+Each command exits nonzero on a finding.
 
-## Commands
+---
 
-### `cas drift`
+## Top-level options
 
-Compares `package.json` declarations to `package-lock.json` resolutions.
-Checks two things:
+```
+cas [OPTIONS] COMMAND [ARGS]...
+```
 
-* **Direct deps.** Every dependency in `package.json` resolves to a matching
-  entry in the lockfile. Defaults to literal-equality (catches policy
-  violations in projects that use `save-exact=true`); pass `--ranges` to relax
-  to SemVer-range satisfaction (`^1.2.3` accepts `1.2.5`).
-* **Transitive deps.** Every lockfile entry's own dependency declarations are
-  walked, and each child's resolved version is checked against the parent's
-  declared range. This catches lockfile tampering that touches only a
-  transitive — the parent's declared range no longer matches the resolved
-  child.
+| Flag                   | Behavior                                           |
+| ---------------------- | -------------------------------------------------- |
+| `-V`, `--version`      | Print cas version and exit.                        |
+| `-v`, `--verbose`      | Verbose logging to stderr (DEBUG level).           |
+| `-h`, `--help`         | Show top-level help.                               |
+
+---
+
+## `cas drift`
+
+Compare `package.json` declarations to `package-lock.json` resolutions
+and report inconsistencies — both legitimate drift and the more subtle
+signatures of lockfile tampering.
+
+```
+cas drift [OPTIONS] FRONTEND_DIR
+```
+
+`FRONTEND_DIR` is the project root containing both `package.json` and
+`package-lock.json`.
+
+Three categories of finding:
+
+1. **Direct drift.** Every dependency declared in `package.json`
+   (`dependencies`, `devDependencies`, `optionalDependencies`) must
+   resolve to a matching entry in the lockfile. Defaults to literal
+   equality — catches policy violations in projects that use
+   `save-exact=true` in their `.npmrc`.
+2. **Transitive drift.** Every lockfile entry's own `dependencies` /
+   `optionalDependencies` declarations are walked; each child's resolved
+   version is checked against its parent's declared SemVer range.
+   Resolution mirrors npm's nested-before-hoisted lookup. Catches
+   lockfile tampering that touches only a transitive — the parent's
+   declared range no longer matches the resolved child. Respects
+   `optionalDependencies` (missing is fine) and `peerDependencies`
+   (missing is fine — consumer may provide).
+3. **Orphan entries.** Installable lockfile entries not reachable from
+   any `package.json` declaration via BFS over the dep graph
+   (`dependencies` / `peerDependencies` / `optionalDependencies` /
+   `bundleDependencies`). The most plausible footprint of a malicious
+   extra package inserted into the lockfile.
+
+| Flag                | Behavior                                                                                                              |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `--ranges`          | Treat `package.json` declarations as SemVer ranges instead of requiring literal equality. Use when the project doesn't pin exact versions. |
+| `--no-transitive`   | Skip transitive drift detection (only check direct deps). Also disables orphan-entry detection, since orphan detection walks the transitive graph. |
+| `--json`            | Machine-readable JSON on stdout instead of human text.                                                                |
+| `-h`, `--help`      | Show help.                                                                                                            |
 
 ```bash
-cas drift ./frontend                # direct (strict) + transitive (range)
-cas drift ./frontend --ranges       # direct (range) + transitive (range)
-cas drift ./frontend --no-transitive
+cas drift ./frontend                # direct strict + transitive + orphans
+cas drift ./frontend --ranges       # direct as range + transitive + orphans
+cas drift ./frontend --no-transitive  # direct strict only
+cas drift ./frontend --json
 ```
 
-Resolution mirrors npm's nested-before-hoisted lookup, and respects
-`optionalDependencies` (missing is fine) and `peerDependencies` (missing is
-fine — the consumer may provide them).
+Fix message includes the exact regen command:
+`npm install --package-lock-only --include=optional --force`. The `--force`
+matters — without it, npm prunes foreign-platform optional deps from the
+lockfile (npm/cli#4828, #7961) and the Docker build breaks at install time.
 
-### `cas sri patch`
+---
 
-Walks `package-lock.json` and injects `dist.integrity` into every entry that
-doesn't have one, using CodeArtifact's `ListPackageVersionAssets` API to pull
-the SHA-512 each package stores. The hash CodeArtifact returns matches what
-the public npm registry publishes as `dist.integrity` for the same tarball
-— verified by cross-reference across several popular packages.
+## `cas sri patch`
+
+Walk `package-lock.json` and inject `dist.integrity` into every entry
+that's missing it (or has only weak sha1), using CodeArtifact's
+`ListPackageVersionAssets` API to pull each package's stored SHA-512.
+
+```
+cas sri patch [OPTIONS] LOCKFILE
+```
+
+The hash CodeArtifact returns matches what the public npm registry
+publishes as `dist.integrity` for the same tarball — verified by
+cross-reference against multiple popular packages.
+
+**Bundled entries** (`inBundle: true`) are skipped: the standalone hash
+CodeArtifact returns for those describes the registry publication, not
+the bytes the parent author may have modified before bundling. The
+parent's integrity hash is the legitimate trust root for bundled
+content (and `cas sri verify` checks that anchoring).
+
+**Weak-algorithm upgrade.** Any entry whose only integrity value is
+`sha1-…` gets overwritten with `sha512-…` from CodeArtifact. SHA-1 was
+removed from the modern SRI spec.
+
+| Flag                | Behavior                                                                                            |
+| ------------------- | --------------------------------------------------------------------------------------------------- |
+| `--domain TEXT`     | **Required.** CodeArtifact domain. Env: `CAS_DOMAIN`.                                               |
+| `--repository TEXT` | **Required.** CodeArtifact repository within the domain. Env: `CAS_REPOSITORY`.                     |
+| `--dry-run`         | Report what would be patched without writing the lockfile. Still makes the CodeArtifact API calls. |
+| `--json`            | Machine-readable JSON on stdout instead of human text.                                              |
+| `-h`, `--help`      | Show help.                                                                                          |
 
 ```bash
 cas sri patch ./frontend/package-lock.json \
   --domain my-domain \
   --repository my-repo
 
-# Don't write the file, just report what would change:
 cas sri patch ./frontend/package-lock.json \
   --domain my-domain --repository my-repo --dry-run
+
+# Via env vars (cleaner in CI):
+export CAS_DOMAIN=my-domain
+export CAS_REPOSITORY=my-repo
+cas sri patch ./frontend/package-lock.json
 ```
 
-Uses your AWS credential chain (env, profile, IRSA, etc.). Needs
-`codeartifact:ListPackageVersionAssets` on the target repository.
+Uses your AWS credential chain (env, profile, IRSA, etc.). Needs the IAM
+permission `codeartifact:ListPackageVersionAssets` on the target repository.
 
-### `cas sri verify`
+Exit codes: `0` on success, `1` on configuration errors,
+`2` if there were AWS API errors or packages unreachable in
+CodeArtifact (e.g., a dep that's never been ingested).
+
+---
+
+## `cas sri verify`
 
 Pure-lockfile read — no AWS calls — that reports SRI coverage and fails
-below threshold. Pair with `sri patch` so the lockfile is always
+below threshold. Pair with `cas sri patch` so the lockfile is always
 integrity-complete before merge.
+
+```
+cas sri verify [OPTIONS] LOCKFILE
+```
+
+**Coverage semantics:** an entry counts as covered iff (1) it has its own
+`integrity` field using sha256/sha384/sha512, OR (2) it's a bundled entry
+(`inBundle: true`) whose **parent** is itself covered. Parent-anchoring is
+recursive — a bundle chain anchors to the topmost non-bundled ancestor's
+hash.
+
+Why parent-anchoring is sound: npm at install time re-derives the bundle
+relationship from the parent's `package.json` (which lives inside the
+parent's tarball, which is integrity-verified). An attacker cannot forge
+`inBundle: true` to escape gating without also arranging a parent whose
+hash anchors the real `bundleDependencies` list — and forging that hash
+requires breaking SHA-512.
+
+**SHA-1 is treated as missing.** Entries whose only integrity value is
+`sha1-…` do not count toward coverage. Combined SRI strings
+(`"sha1-... sha512-..."`) count as covered as long as at least one
+algorithm is in the strong set (sha256/sha384/sha512).
+
+| Flag                            | Behavior                                                                |
+| ------------------------------- | ----------------------------------------------------------------------- |
+| `--min-coverage FLOAT`          | Minimum percent of entries that must be covered. Range `0–100`. Default `100.0`. |
+| `--json`                        | Machine-readable JSON on stdout instead of human text.                  |
+| `-h`, `--help`                  | Show help.                                                              |
 
 ```bash
 cas sri verify ./frontend/package-lock.json --min-coverage 100
+cas sri verify ./frontend/package-lock.json --min-coverage 99.9 --json
 ```
 
-### `cas registry`
+Refuses to operate on a v1 lockfile (would otherwise report 0/0 = 100%
+and silently pass).
 
-Walks every `resolved` URL in the lockfile and fails when any host doesn't
-match one of the `--allowed-host` patterns or when any URL uses a non-HTTPS
-scheme. Reads the lockfile only — never `.npmrc` or machine-level npm
-config — because the lockfile is what `npm ci` obeys at install time. The
-project must declare its allowed registry hosts to the checker explicitly.
+---
 
-`--allowed-host` is **label-anchored**: the host must equal the pattern or
-end with `.` + the pattern. Substring matching is intentionally not
+## `cas registry`
+
+Walk every `resolved` URL in the lockfile and fail when:
+* the host doesn't match the allowed-host list (or, in auto-detect, isn't
+  one of the project's primary registries), OR
+* the URL uses a non-HTTPS scheme.
+
+```
+cas registry [OPTIONS] LOCKFILE
+```
+
+Reads the lockfile only — never `.npmrc` or machine-level npm config —
+because the lockfile is what `npm ci` actually obeys at install time.
+
+### Two modes
+
+**Strict mode** — supply one or more `--allowed-host`:
+
+Every entry's resolved host must equal or end with `.` + one of the
+patterns. Patterns are **label-anchored**: a host must equal the pattern
+or end with `.` + the pattern. Substring matching is intentionally not
 supported because it lets attacker-controlled hosts like
 `evil.d.codeartifact.attacker.com` pass an allowlist of `.d.codeartifact.`.
 
 ```bash
-# Single allowed host (note the FULL suffix — region + amazonaws.com):
 cas registry ./frontend/package-lock.json \
   --allowed-host '.d.codeartifact.ap-northeast-1.amazonaws.com'
 
-# Multiple (CodeArtifact + a corporate mirror):
 cas registry ./frontend/package-lock.json \
   --allowed-host '.d.codeartifact.ap-northeast-1.amazonaws.com' \
   --allowed-host 'mirror.corp.example'
-
-# Also fail on git-sourced deps (they bypass any registry contract):
-cas registry ./frontend/package-lock.json \
-  --allowed-host '.d.codeartifact.ap-northeast-1.amazonaws.com' \
-  --fail-on-git
 ```
 
-`http://` and other non-HTTPS schemes are always rejected, regardless of host.
+Use strict mode in CI for a project with a known, declared registry policy.
 
-### `cas scripts`
+**Auto-detect mode** — omit `--allowed-host`:
 
-Lifecycle-script audit. Fails the build on any lockfile entry whose
-`hasInstallScript: true` — meaning npm will execute that package's
-`preinstall`, `install`, or `postinstall` hook at `npm install` time.
-This is the highest-blast-radius unhandled vector in the npm ecosystem:
-SRI binds bytes to hashes but doesn't prevent a maintainer from
-deliberately shipping a malicious lifecycle hook.
+cas reads the lockfile's `resolved` URL distribution and treats every host
+carrying ≥20% of the top host's entry count as primary. A
+100%-CodeArtifact lockfile, a 100%-public-npm lockfile, a CodeArtifact +
+corporate-mirror mix — all three pass cleanly without per-project
+configuration. One-off anomalies (the dependency-confusion attack
+signature) still fall below the threshold and are flagged as CRITICAL.
+
+```bash
+# Sweep mixed repos without per-project config:
+for lf in */package-lock.json; do cas registry "$lf" --json; done
+```
+
+The detected primaries are surfaced in human output (`Auto-detected
+primary registries: …`) and in JSON (`detected_primary_hosts` field).
+
+| Flag                       | Behavior                                                                                                    |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `--allowed-host TEXT`      | Hostname suffix (case-insensitive, label-anchored). Repeatable. Use the FULL suffix. **Omit entirely** to enter auto-detect mode. Env: `CAS_ALLOWED_HOSTS` (whitespace-separated). |
+| `--fail-on-git`            | Also fail (exit 1) on any entry resolved directly from git. By default git-sourced entries are reported as MEDIUM but don't fail the run. |
+| `--json`                   | Machine-readable JSON on stdout instead of human text.                                                      |
+| `-h`, `--help`             | Show help.                                                                                                  |
+
+### Entry classification
+
+Each lockfile entry lands in exactly one bucket:
+
+| Bucket                 | Severity | Meaning                                                          |
+| ---------------------- | -------- | ---------------------------------------------------------------- |
+| `registry_leak`        | CRITICAL | Resolved from a host that isn't allowed (or is primary in auto). |
+| `git_sourced`          | MEDIUM   | `git+ssh:` / `github:` / similar. Bypasses any registry.         |
+| `unresolved_phantom`   | LOW      | Has a `version` but no `resolved` and is not `inBundle: true`. Usually dedupe artefact, occasionally a tampering signature. |
+| `bundled`              | INFO     | Marked `inBundle: true`. Bytes come from the parent's tarball.   |
+| File / workspace       | —        | `file:` paths or `link: true` symlinks. Not registry-classified. |
+| (insecure scheme)      | CRITICAL | http://, ftp://, ws:// etc. — rejected regardless of host.       |
+
+A `mixed registries` warning appears whenever more than one distinct host
+shows up — useful signal that the install path isn't homogeneous, even
+when all hosts are allowed.
+
+---
+
+## `cas scripts`
+
+Fail on any lockfile entry whose `hasInstallScript: true` — meaning npm
+will execute that package's `preinstall`, `install`, or `postinstall`
+hook when `npm install` runs. This is the highest-blast-radius
+unhandled vector in the npm ecosystem: SRI binds bytes to hashes but
+doesn't prevent a maintainer from deliberately shipping a malicious
+lifecycle hook.
+
+```
+cas scripts [OPTIONS] LOCKFILE
+```
+
+| Flag              | Behavior                                                                                          |
+| ----------------- | ------------------------------------------------------------------------------------------------- |
+| `--allow TEXT`    | Package name (including scope, e.g. `@parcel/watcher`) permitted to run install scripts. Repeatable. Env: `CAS_ALLOWED_SCRIPTS` (whitespace-separated). |
+| `--json`          | Machine-readable JSON on stdout instead of human text.                                            |
+| `-h`, `--help`    | Show help.                                                                                        |
 
 ```bash
 # Fail on any unaudited script-runner:
 cas scripts ./frontend/package-lock.json
 
-# Allowlist the build-essentials that legitimately need to compile
-# platform binaries at install time:
+# Allowlist build-essentials that legitimately need to compile platform binaries:
 cas scripts ./frontend/package-lock.json \
   --allow esbuild \
   --allow fsevents \
-  --allow @parcel/watcher
+  --allow @parcel/watcher \
+  --allow @swc/core
 ```
 
-Allowlist entries are matched by full package name (including scope).
+Allowlist matching is by **full package name including scope**.
 `watcher` does NOT match `@parcel/watcher` — preventing typo-squat
-substitution attacks against the allowlist itself.
+substitution attacks against the allowlist itself. Matching is
+case-insensitive.
 
 To eliminate lifecycle scripts entirely, install with
-`npm ci --ignore-scripts` and find replacements for any script-running deps.
+`npm ci --ignore-scripts` and find replacements for any script-running
+deps.
 
-### Registry classification
+---
 
-Classifies each entry into one of:
-* **Allowed host** — counted in the per-host distribution.
-* **Leaked** — resolved from a host that doesn't match any allowed pattern.
-* **Git-sourced** — `git+ssh:` / `github:` etc., bypasses any registry.
-* **File / workspace** — `file:` paths or `link: true` symlinks.
-* **Unresolved** — deduped phantom entries with no `resolved` field.
+## Lockfile structure validation
 
-A `mixed registries` warning appears whenever more than one distinct host
-shows up, even if both are allowed — useful signal that the install path
-isn't homogeneous.
+Every command refuses to operate on a structurally-suspect lockfile
+before any other check runs. Specifically, the loader rejects:
+
+* Lockfile version 1 (no per-entry `resolved` URLs; obsoletes the whole
+  premise of SRI gating).
+* Package keys containing `..` (path traversal).
+* Package keys starting with `/` or `\` (absolute paths).
+* Package keys containing null bytes or control characters.
+* Package keys with empty path segments (`node_modules//foo`).
+
+All of these emit `[HIGH] FAIL — <reason>` and exit `1` cleanly — never
+a Python traceback. The whole loader is shared across subcommands, so
+the check is consistent everywhere.
+
+---
+
+## Environment variables
+
+| Variable                  | Used by              | Effect                                                      |
+| ------------------------- | -------------------- | ----------------------------------------------------------- |
+| `CAS_DOMAIN`              | `cas sri patch`      | Default for `--domain`.                                     |
+| `CAS_REPOSITORY`          | `cas sri patch`      | Default for `--repository`.                                 |
+| `CAS_ALLOWED_HOSTS`       | `cas registry`       | Whitespace-separated default for `--allowed-host`.          |
+| `CAS_ALLOWED_SCRIPTS`     | `cas scripts`        | Whitespace-separated default for `--allow`.                 |
+| Standard `AWS_*`          | `cas sri patch`      | Picked up by boto3 for CodeArtifact API auth.               |
+
+---
 
 ## Wiring into CI
 
-A complete gate looks like:
+A complete gate looks like this (Semaphore CI):
 
 ```yaml
-- uses: actions/setup-python@v5
-  with: { python-version: "3.12" }
-
-- name: Install codeartifact-shield
-  run: pip install "git+https://github.com/alexandernicholson/codeartifact-shield.git"
-
-- name: Drift + orphan check
-  run: cas drift ./frontend
-
-- name: Integrity coverage
-  run: cas sri verify ./frontend/package-lock.json --min-coverage 100
-
-- name: Registry-leakage check
-  run: cas registry ./frontend/package-lock.json --allowed-host '.d.codeartifact.ap-northeast-1.amazonaws.com'
-
-- name: Lifecycle-script audit
-  run: cas scripts ./frontend/package-lock.json --allow esbuild --allow fsevents
+- name: Supply Chain Checks
+  task:
+    agent:
+      machine: { type: s1-supernode-x86-small }
+      containers:
+        - name: main
+          image: 'public.ecr.aws/docker/library/python:3.12'
+    jobs:
+      - name: Drift
+        commands:
+          - source ./.semaphore/commands/install-cas.sh
+          - cas drift .
+      - name: SRI Coverage
+        commands:
+          - source ./.semaphore/commands/install-cas.sh
+          - cas sri patch ./package-lock.json --domain my-domain --repository my-repo
+          - cas sri verify ./package-lock.json --min-coverage 100
+      - name: Registry Leakage
+        commands:
+          - source ./.semaphore/commands/install-cas.sh
+          - cas registry ./package-lock.json --allowed-host '.d.codeartifact.<region>.amazonaws.com'
+      - name: Lifecycle Scripts
+        commands:
+          - source ./.semaphore/commands/install-cas.sh
+          - cas scripts ./package-lock.json --allow esbuild --allow fsevents
 ```
 
-If you regenerate the lockfile in CI (e.g. after `npm install`), patch
-integrity hashes before verifying:
+`install-cas.sh` should pin cas by **literal SHA**, not via a
+`${CAS_REF:-…}` fallback that lets a hostile env var redirect pip. Example:
 
-```yaml
-- run: |
-    cas sri patch ./frontend/package-lock.json \
-      --domain "$CAS_DOMAIN" --repository "$CAS_REPOSITORY"
-    cas sri verify ./frontend/package-lock.json --min-coverage 100
-  env:
-    CAS_DOMAIN: ${{ vars.CAS_DOMAIN }}
-    CAS_REPOSITORY: ${{ vars.CAS_REPOSITORY }}
-    # standard AWS_* creds from your assume-role step also need to be present
+```bash
+#!/usr/bin/env bash
+set -e
+# Hard-coded — not configurable via env. The version check below is
+# operational sanity, not a security control.
+readonly _CAS_INSTALL_REF="git+https://github.com/TableCheck-Labs/codeartifact-shield.git@<full-sha>"
+readonly _CAS_EXPECTED_VERSION="0.4.0"
+if ! command -v cas >/dev/null 2>&1; then
+  pip install --quiet "$_CAS_INSTALL_REF"
+fi
+actual=$(cas --version | awk '{print $NF}')
+[ "$actual" = "$_CAS_EXPECTED_VERSION" ] || { echo "[FATAL] cas version mismatch"; exit 1; }
 ```
+
+---
 
 ## Exit codes
 
-| Command | 0 | 1 | 2 |
-|---|---|---|---|
-| `drift` | no drift | drift detected (direct or transitive) | — |
-| `sri patch` | all entries reconciled | config error | API errors or packages missing from CodeArtifact |
-| `sri verify` | coverage ≥ threshold | coverage below threshold or unsupported lockfile | — |
-| `registry` | every entry resolved from an allowed host | leaked entries (or `--fail-on-git` and any git-sourced) | — |
+| Command       | `0`                                  | `1`                                                                       | `2`                                                       |
+| ------------- | ------------------------------------ | ------------------------------------------------------------------------- | --------------------------------------------------------- |
+| `drift`       | no drift, no orphans                 | drift detected (direct/transitive/orphan) or unsupported lockfile         | —                                                         |
+| `sri patch`   | all entries reconciled               | configuration / lockfile-load error                                       | AWS API errors **or** packages missing from CodeArtifact  |
+| `sri verify`  | coverage ≥ threshold                 | coverage below threshold or unsupported lockfile                          | —                                                         |
+| `registry`    | every entry on an allowed host       | leaks detected (or `--fail-on-git` with any git-sourced) or load error    | —                                                         |
+| `scripts`     | every script-runner is allowlisted   | unallowlisted script-running entry found or load error                    | —                                                         |
+
+---
 
 ## Scope and non-goals
 
-* **npm only.** This tool exists for the specific CodeArtifact-vs-npm gap.
-  pip / Maven / NuGet have their own integrity stories.
+* **npm only.** Built for the CodeArtifact-vs-npm gap. pip / Maven /
+  NuGet / Cargo have their own integrity stories.
 * **Lockfile v2 and v3.** Older v1 lockfiles use a different structure and
-  aren't supported — `sri verify` and `registry` will error out so a v1
-  lockfile can't accidentally pass a 100% gate. Regenerate with Node 16+.
-* **No `.npmrc` parsing.** The lockfile is the source of truth. A project
-  that wants its registry policy checked must pass the allowed hosts to the
-  tool explicitly.
+  aren't supported — every subcommand errors out so a v1 lockfile can't
+  accidentally pass a 100% gate. Regenerate the lockfile with Node 16+.
+* **No `.npmrc` parsing.** The lockfile is the source of truth for what
+  `npm ci` will fetch.
+* **No deep dependency review.** `cas` doesn't fetch package contents or
+  audit source code. It validates the *shape* of the supply chain
+  (where bytes come from, whether they're integrity-pinned, whether they
+  run code at install time).
+
+---
 
 ## License
 
