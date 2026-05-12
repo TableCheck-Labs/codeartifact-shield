@@ -195,6 +195,25 @@ def drift_cmd(frontend_dir: Path, ranges: bool, no_transitive: bool) -> None:
                 f"  ... and {len(report.transitive_mismatches) - 50} more", err=True
             )
 
+    if report.orphan_entries:
+        click.echo(
+            f"\nOrphan lockfile entries ({len(report.orphan_entries)}) — "
+            "not reachable from any declared dependency:",
+            err=True,
+        )
+        for key in report.orphan_entries[:30]:
+            click.echo(f"  {key}", err=True)
+        if len(report.orphan_entries) > 30:
+            click.echo(
+                f"  ... and {len(report.orphan_entries) - 30} more", err=True
+            )
+        click.echo(
+            "  These entries have no parent in the dep graph rooted at "
+            "package.json. The most plausible cause is lockfile tampering "
+            "(or a partial regeneration). Re-run `npm install --package-lock-only`.",
+            err=True,
+        )
+
     click.echo(
         "\nFix: re-run `npm install --package-lock-only` and commit the regenerated lockfile.",
         err=True,

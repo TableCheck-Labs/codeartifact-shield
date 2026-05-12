@@ -92,6 +92,105 @@ def test_raises_on_missing_lockfile(tmp_path: Path) -> None:
         raise AssertionError("expected FileNotFoundError")
 
 
+# ---------------------------------------------------------------------------
+# G9 — orphan lockfile entries: any installable entry not reachable from
+# package.json's declared graph is a tampering signature.
+# ---------------------------------------------------------------------------
+
+
+def test_detects_orphan_lockfile_entry(tmp_path: Path) -> None:
+    """A lockfile entry not declared by package.json or any transitive parent
+    is the most plausible footprint of a malicious insertion."""
+    root = _write_pair(
+        tmp_path,
+        {"dependencies": {"lodash": "4.17.21"}},
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"dependencies": {"lodash": "4.17.21"}},
+                "node_modules/lodash": {"version": "4.17.21"},
+                "node_modules/sneaky-injected": {
+                    "version": "1.0.0",
+                    "resolved": "https://acme.d.codeartifact.us-east-1.amazonaws.com/-/sneaky-1.0.0.tgz",
+                    "integrity": "sha512-" + "a" * 86 + "==",
+                },
+            },
+        },
+    )
+    report = check_npm_drift(root)
+    assert not report.clean
+    assert "node_modules/sneaky-injected" in report.orphan_entries
+
+
+def test_transitive_deps_are_not_orphans(tmp_path: Path) -> None:
+    """A package brought in transitively via a declared parent is NOT an orphan."""
+    root = _write_pair(
+        tmp_path,
+        {"dependencies": {"parent-pkg": "1.0.0"}},
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"dependencies": {"parent-pkg": "1.0.0"}},
+                "node_modules/parent-pkg": {
+                    "version": "1.0.0",
+                    "dependencies": {"transitive-pkg": "^2.0.0"},
+                },
+                "node_modules/transitive-pkg": {"version": "2.0.5"},
+            },
+        },
+    )
+    report = check_npm_drift(root)
+    assert report.orphan_entries == []
+
+
+def test_bundled_entries_are_not_orphans(tmp_path: Path) -> None:
+    """A bundleDependencies child IS reachable via the parent's bundleDependencies."""
+    root = _write_pair(
+        tmp_path,
+        {"dependencies": {"@clack/prompts": "0.6.3"}},
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"dependencies": {"@clack/prompts": "0.6.3"}},
+                "node_modules/@clack/prompts": {
+                    "version": "0.6.3",
+                    "bundleDependencies": ["is-unicode-supported"],
+                },
+                "node_modules/@clack/prompts/node_modules/is-unicode-supported": {
+                    "version": "1.3.0",
+                    "inBundle": True,
+                },
+            },
+        },
+    )
+    report = check_npm_drift(root)
+    assert report.orphan_entries == []
+
+
+def test_dev_deps_are_reachable(tmp_path: Path) -> None:
+    """devDependencies entries (e.g. eslint) must not be flagged as orphans."""
+    root = _write_pair(
+        tmp_path,
+        {
+            "dependencies": {"react": "18.3.1"},
+            "devDependencies": {"eslint": "9.0.0"},
+        },
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "dependencies": {"react": "18.3.1"},
+                    "devDependencies": {"eslint": "9.0.0"},
+                },
+                "node_modules/react": {"version": "18.3.1"},
+                "node_modules/eslint": {"version": "9.0.0"},
+            },
+        },
+    )
+    report = check_npm_drift(root)
+    assert report.orphan_entries == []
+
+
 def test_ignores_transitives_when_disabled(tmp_path: Path) -> None:
     """Top-level package.json doesn't declare transitives; with --no-transitive nothing flags."""
     root = _write_pair(
@@ -189,19 +288,25 @@ def test_transitive_drift_when_resolved_outside_range(tmp_path: Path) -> None:
 
 
 def test_transitive_resolves_nested_node_modules_first(tmp_path: Path) -> None:
-    """foo depends on bar @ ^1; both a hoisted bar @ 2.0.0 and a nested bar @ 1.5.0 exist.
-    The nested one wins, so this should be clean."""
+    """foo depends on bar @ ^1; both a hoisted bar @ 2.0.0 (brought in by
+    a sibling dep) and a nested bar @ 1.5.0 (for foo) exist. The nested one
+    wins for foo's resolution, so this should be clean."""
     root = _write_pair(
         tmp_path,
-        {"dependencies": {"foo": "1.0.0"}},
+        {"dependencies": {"foo": "1.0.0", "baz": "1.0.0"}},
         {
             "lockfileVersion": 3,
             "packages": {
+                "": {"dependencies": {"foo": "1.0.0", "baz": "1.0.0"}},
                 "node_modules/foo": {
                     "version": "1.0.0",
                     "dependencies": {"bar": "^1.0.0"},
                 },
                 "node_modules/foo/node_modules/bar": {"version": "1.5.0"},
+                "node_modules/baz": {
+                    "version": "1.0.0",
+                    "dependencies": {"bar": "^2.0.0"},
+                },
                 "node_modules/bar": {"version": "2.0.0"},
             }
         },
@@ -220,10 +325,15 @@ def test_transitive_walks_intermediate_ancestor_node_modules(tmp_path: Path) -> 
     """
     root = _write_pair(
         tmp_path,
-        {"dependencies": {"a": "1.0.0"}},
+        # Root also depends on x directly at a pinned version, which is what
+        # justifies the hoisted top-level node_modules/x. Without this, the
+        # top-level x would be an orphan (which is the legitimate "lockfile
+        # has an entry no one declared" tampering case).
+        {"dependencies": {"a": "1.0.0", "x": "2.0.30"}},
         {
             "lockfileVersion": 3,
             "packages": {
+                "": {"dependencies": {"a": "1.0.0", "x": "2.0.30"}},
                 "node_modules/a": {
                     "version": "1.0.0",
                     "dependencies": {"b": "^1.0.0"},
@@ -236,9 +346,9 @@ def test_transitive_walks_intermediate_ancestor_node_modules(tmp_path: Path) -> 
                     "version": "1.0.0",
                     "dependencies": {"x": "^2.0.0"},
                 },
-                # x is hoisted up to A's node_modules at the correct version
+                # x is hoisted up to A's node_modules at the correct version for c
                 "node_modules/a/node_modules/x": {"version": "2.27.1"},
-                # …and a different, incompatible x sits at the root
+                # …and a different x sits at the root (justified by the direct dep above)
                 "node_modules/x": {"version": "2.0.30"},
             }
         },

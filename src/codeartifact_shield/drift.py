@@ -49,9 +49,21 @@ class DriftReport:
     transitive_mismatches: list[tuple[str, str, str, str]] = field(default_factory=list)
     """Transitive-dep disagreements: ``(parent_key, child_name, declared_range, resolved)``."""
 
+    orphan_entries: list[str] = field(default_factory=list)
+    """Installable lockfile entries that are NOT reachable from the dependency
+    graph rooted at ``package.json``. A clean lockfile is a closed set: every
+    entry traces back through ``dependencies``/``peerDependencies``/
+    ``optionalDependencies``/``bundleDependencies`` to a top-level declaration.
+    An entry without that trace is a tampering signature — the most plausible
+    way a malicious extra package lands in a lockfile."""
+
     @property
     def clean(self) -> bool:
-        return not self.mismatches and not self.transitive_mismatches
+        return (
+            not self.mismatches
+            and not self.transitive_mismatches
+            and not self.orphan_entries
+        )
 
 
 _NON_SEMVER_PREFIXES = (
@@ -214,4 +226,66 @@ def check_npm_drift(
                             (parent_key or "<root>", child_name, declared_range, resolved)
                         )
 
+        # ---- Orphan / undeclared lockfile entries ---------------------------
+        # Logically depends on walking the dep graph, so tied to transitive
+        # mode. ``--no-transitive`` is a "quick smoke test" flag; users who
+        # want orphan detection should leave transitive on.
+        report.orphan_entries = _find_orphan_entries(pkg, lock_pkgs)
+
     return report
+
+
+def _find_orphan_entries(
+    pkg: dict[str, Any],
+    lock_pkgs: dict[str, Any],
+) -> list[str]:
+    """Return every installable lockfile entry not reachable from package.json.
+
+    Walks the declared dep graph (``dependencies`` + ``devDependencies`` +
+    ``optionalDependencies`` + ``peerDependencies`` + ``bundleDependencies``)
+    via npm's nested-before-hoisted resolution rule. Any installable entry
+    that isn't visited is an orphan — most plausibly inserted by a tampered
+    lockfile or partial regeneration.
+    """
+    reachable: set[str] = set()
+    queue: list[tuple[str, str]] = []
+
+    # Seed from root's package.json declarations.
+    for kind in (
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ):
+        for name in pkg.get(kind, {}).keys():
+            queue.append(("", name))
+
+    while queue:
+        parent_key, child_name = queue.pop()
+        child_key = _resolve_transitive_key(parent_key, child_name, lock_pkgs)
+        if child_key is None or child_key in reachable:
+            continue
+        reachable.add(child_key)
+        entry = lock_pkgs[child_key]
+        for kind in ("dependencies", "peerDependencies", "optionalDependencies"):
+            for grandchild_name in entry.get(kind, {}).keys():
+                queue.append((child_key, grandchild_name))
+        # bundleDependencies are nested by name under the parent's node_modules.
+        for bundled_name in entry.get("bundleDependencies", []) or []:
+            bundled_key = f"{child_key}/node_modules/{bundled_name}"
+            if bundled_key in lock_pkgs and bundled_key not in reachable:
+                reachable.add(bundled_key)
+                # Walk the bundled entry's own declared deps too.
+                queue.append((child_key, bundled_name))
+
+    orphans: list[str] = []
+    for key, entry in lock_pkgs.items():
+        if not key:
+            continue
+        if entry.get("link"):
+            continue
+        if not entry.get("version"):
+            continue
+        if key not in reachable:
+            orphans.append(key)
+    return sorted(orphans)
