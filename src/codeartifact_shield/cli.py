@@ -40,7 +40,11 @@ from codeartifact_shield._output import (
     severity_badge,
     severity_counts,
 )
-from codeartifact_shield.audit import SEVERITY_RANK, audit_lockfile
+from codeartifact_shield.audit import (
+    DEFAULT_PROBE_WORKERS,
+    SEVERITY_RANK,
+    audit_lockfile,
+)
 from codeartifact_shield.cooldown import (
     DEFAULT_MAX_WORKERS,
     DEFAULT_MIN_AGE_DAYS,
@@ -962,12 +966,70 @@ _AUDIT_SEVERITY_TO_CAS = {
     "--allow-private",
     "allow_unaudited",
     multiple=True,
-    envvar="CAS_AUDIT_ALLOW_PRIVATE",
+    envvar="CAS_ALLOW_PRIVATE",
     help=(
         "Package name (including scope) permitted to be unauditable. "
-        "Repeatable. Demotes the HIGH `unaudited_private` finding to "
-        "INFO for that name. Typical use: trusted org-internal packages "
-        "you accept won't be in OSV."
+        "Repeatable. Shared with `cas cooldown` — set once via "
+        "`CAS_ALLOW_PRIVATE` to apply to both commands. Demotes the "
+        "HIGH `unaudited_private` finding to INFO for that name. Use "
+        "sparingly — prefer `--ca-domain` so CodeArtifact vouches for "
+        "an entire scope at once."
+    ),
+)
+@click.option(
+    "--ca-domain",
+    "ca_domain",
+    default=None,
+    envvar="CAS_DOMAIN",
+    help=(
+        "CodeArtifact domain. When set, packages not on the "
+        "`--probe-private` public registry are checked against this "
+        "CA endpoint (with a fresh bearer token via boto3). A hit "
+        "demotes the finding to INFO `unaudited_allowed`. "
+        "Lets `cas audit` mirror `cas cooldown`'s deployment model."
+    ),
+)
+@click.option(
+    "--ca-repository",
+    "ca_repository",
+    default=None,
+    envvar="CAS_REPOSITORY",
+    help="CodeArtifact repository name. Required when `--ca-domain` is set.",
+)
+@click.option(
+    "--ca-domain-owner",
+    "ca_domain_owner",
+    default=None,
+    envvar="CAS_DOMAIN_OWNER",
+    help=(
+        "CodeArtifact domain-owner AWS account ID. Optional — boto3 "
+        "infers it from the caller account if omitted."
+    ),
+)
+@click.option(
+    "--max-workers",
+    type=int,
+    default=DEFAULT_PROBE_WORKERS,
+    show_default=True,
+    envvar="CAS_AUDIT_MAX_WORKERS",
+    help=(
+        "Thread-pool size for parallel `--probe-private` / CA probe "
+        "HTTP requests. I/O-bound, so high values are safe. Lower to "
+        "1 to force serial mode for debugging."
+    ),
+)
+@click.option(
+    "--probe-cache",
+    "probe_cache_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    envvar="CAS_AUDIT_PROBE_CACHE",
+    help=(
+        "Path to a JSON cache of probe results (which packages exist on "
+        "which registries). Massively speeds up re-runs in CI: a fully-"
+        "cached audit completes in well under a second on a 2500-package "
+        "lockfile. Cache entries never invalidate — package existence is "
+        "stable enough that staleness isn't a correctness concern."
     ),
 )
 @click.option(
@@ -983,12 +1045,41 @@ def audit_cmd(
     whitelist_file: Path | None,
     probe_registry: str | None,
     allow_unaudited: tuple[str, ...],
+    ca_domain: str | None,
+    ca_repository: str | None,
+    ca_domain_owner: str | None,
+    max_workers: int,
+    probe_cache_path: Path | None,
     json_output: bool,
 ) -> None:
     """Query OSV.dev for known vulnerabilities in every (name, version) in the lockfile."""
     floor = None
     if min_severity:
         floor = "MEDIUM" if min_severity.lower() == "moderate" else min_severity.upper()
+
+    trusted_endpoints: list[RegistryEndpoint] = []
+    if ca_domain:
+        if not ca_repository:
+            click.echo(
+                f"{severity_badge(Severity.HIGH)} FAIL — "
+                f"`--ca-domain` requires `--ca-repository`",
+                err=True,
+            )
+            sys.exit(1)
+        try:
+            ca = build_codeartifact_endpoint(
+                domain=ca_domain,
+                repository=ca_repository,
+                domain_owner=ca_domain_owner,
+            )
+        except Exception as exc:  # noqa: BLE001
+            click.echo(
+                f"{severity_badge(Severity.HIGH)} FAIL — "
+                f"CodeArtifact auth failed: {exc}",
+                err=True,
+            )
+            sys.exit(1)
+        trusted_endpoints.append(ca)
 
     try:
         report = audit_lockfile(
@@ -998,6 +1089,9 @@ def audit_cmd(
             severity_floor=floor,
             whitelist_file=whitelist_file,
             probe_registry=probe_registry,
+            trusted_endpoints=trusted_endpoints or None,
+            probe_cache_path=probe_cache_path,
+            max_workers=max_workers,
         )
     except ValueError as exc:
         _emit_load_error(json_output, "audit", lockfile, exc)
@@ -1147,13 +1241,13 @@ def audit_cmd(
     "--allow-private",
     "allow_private",
     multiple=True,
-    envvar="CAS_COOLDOWN_ALLOW_PRIVATE",
+    envvar="CAS_ALLOW_PRIVATE",
     help=(
         "Package name (including scope) permitted to be unresolvable on "
-        "every configured registry. Repeatable. Use sparingly — under "
-        "the secure-by-default policy, a name no registry knows is "
-        "treated as a HIGH finding (lockfile tampering / typosquat / "
-        "config gap)."
+        "every configured registry. Repeatable. Shared across `cas "
+        "cooldown` and `cas audit` — set once via `CAS_ALLOW_PRIVATE` "
+        "to apply to both. Use sparingly: a name no registry knows is "
+        "secure-by-default HIGH (typosquat / tampering / config gap)."
     ),
 )
 @click.option(

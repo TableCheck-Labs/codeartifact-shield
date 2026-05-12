@@ -62,7 +62,7 @@ def _mock_from_fixtures(
     def mock_post(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
         return batch_response
 
-    def mock_get(url: str, timeout: int) -> dict[str, Any]:
+    def mock_get(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
         vuln_id = url.rsplit("/", 1)[-1]
         return vuln_db[vuln_id]
 
@@ -293,7 +293,7 @@ def test_audit_dedupes_unique_vuln_detail_fetches(tmp_path: Path) -> None:
             ]
         }
 
-    def mock_get(url: str, timeout: int) -> dict[str, Any]:
+    def mock_get(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
         fetched.append(url)
         return {
             "id": "GHSA-x",
@@ -488,14 +488,14 @@ def test_audit_probe_private_flags_packages_missing_from_public_npm(
         # patched version; @my/internal-only is private).
         return {"results": [{}, {}]}
 
-    def mock_get(url: str, timeout: int) -> dict[str, Any]:
+    def mock_head(url: str, timeout: int, auth_header: str | None = None) -> int:
         # Public npm registry: lodash exists, internal-only is 404.
         if url.endswith("/lodash"):
-            return {"name": "lodash"}
+            return 200
         raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
 
     with patch("codeartifact_shield.audit._http_post_json", mock_batch), patch(
-        "codeartifact_shield.audit._http_get_json", mock_get
+        "codeartifact_shield.audit._http_head_status", mock_head
     ):
         report = audit_lockfile(
             lf, probe_registry="https://registry.npmjs.org"
@@ -514,7 +514,7 @@ def test_audit_probe_private_default_off_no_extra_requests(tmp_path: Path) -> No
     def mock_batch(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
         return {"results": [{}]}
 
-    def mock_get(url: str, timeout: int) -> dict[str, Any]:
+    def mock_get(url: str, timeout: int, auth_header: str | None = None) -> dict[str, Any]:
         get_calls.append(url)
         return {}
 
@@ -552,6 +552,146 @@ def test_audit_uses_name_field_for_npm_aliases(tmp_path: Path) -> None:
     assert queried_names == ["string-width"]  # NOT "string-width-cjs"
 
 
+def test_audit_ca_endpoint_demotes_unaudited_to_info(tmp_path: Path) -> None:
+    # v0.7.1: when a package is 404 on the public probe registry but
+    # FOUND on a configured CA endpoint, treat as trusted-private (INFO),
+    # not HIGH. Mirrors cooldown's CA-fallback model.
+    from codeartifact_shield.cooldown import RegistryEndpoint
+
+    lf = _write_lock(
+        tmp_path,
+        {"node_modules/@my/internal": {"version": "1.0.0"}},
+    )
+
+    def mock_batch(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        return {"results": [{}]}  # no OSV findings
+
+    def mock_head(url: str, timeout: int, auth_header: str | None = None) -> int:
+        if "registry.npmjs.org" in url:
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
+        if "codeartifact" in url:
+            assert auth_header == "Bearer fake-ca-token"
+            return 200
+        raise AssertionError(f"unexpected URL: {url}")
+
+    trusted = [
+        RegistryEndpoint(
+            url="https://my-ca-12345.d.codeartifact.us-east-1.amazonaws.com/npm/my-repo",
+            auth_header="Bearer fake-ca-token",
+            label="my-ca",
+        ),
+    ]
+    with patch("codeartifact_shield.audit._http_post_json", mock_batch), patch(
+        "codeartifact_shield.audit._http_head_status", mock_head
+    ):
+        report = audit_lockfile(
+            lf,
+            probe_registry="https://registry.npmjs.org",
+            trusted_endpoints=trusted,
+        )
+    assert "@my/internal" in report.unaudited_allowed
+    assert "@my/internal" not in report.unaudited_blocked
+    assert report.clean  # build does not fail
+
+
+def test_audit_404_on_all_endpoints_stays_blocked(tmp_path: Path) -> None:
+    # Package 404s on both public probe AND CA endpoint → HIGH, fails build.
+    # This is the typo / lockfile-tampering signal.
+    from codeartifact_shield.cooldown import RegistryEndpoint
+
+    lf = _write_lock(
+        tmp_path, {"node_modules/lodahs": {"version": "1.0.0"}}
+    )
+
+    def mock_batch(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        return {"results": [{}]}
+
+    def mock_head(url: str, timeout: int, auth_header: str | None = None) -> int:
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
+
+    trusted = [
+        RegistryEndpoint(
+            url="https://my-ca.d.codeartifact.us-east-1.amazonaws.com/npm/repo",
+            auth_header="Bearer xxx",
+            label="my-ca",
+        ),
+    ]
+    with patch("codeartifact_shield.audit._http_post_json", mock_batch), patch(
+        "codeartifact_shield.audit._http_head_status", mock_head
+    ):
+        report = audit_lockfile(
+            lf,
+            probe_registry="https://registry.npmjs.org",
+            trusted_endpoints=trusted,
+        )
+    assert "lodahs" in report.unaudited_blocked
+    assert "lodahs" not in report.unaudited_allowed
+    assert not report.clean
+
+
+def test_audit_only_ca_no_public_probe(tmp_path: Path) -> None:
+    # CA-only project: no public probe. Trusted-on-CA → INFO; 404 → HIGH.
+    from codeartifact_shield.cooldown import RegistryEndpoint
+
+    lf = _write_lock(
+        tmp_path,
+        {
+            "node_modules/@my/legit": {"version": "1.0.0"},
+            "node_modules/@my/typo": {"version": "1.0.0"},
+        },
+    )
+
+    def mock_batch(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        return {"results": [{}, {}]}
+
+    def mock_head(url: str, timeout: int, auth_header: str | None = None) -> int:
+        if url.endswith("@my%2Flegit"):
+            return 200
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
+
+    trusted = [
+        RegistryEndpoint(
+            url="https://my-ca.d.codeartifact.us-east-1.amazonaws.com/npm/repo",
+            auth_header="Bearer xxx",
+            label="my-ca",
+        ),
+    ]
+    with patch("codeartifact_shield.audit._http_post_json", mock_batch), patch(
+        "codeartifact_shield.audit._http_head_status", mock_head
+    ):
+        report = audit_lockfile(
+            lf,
+            # No probe_registry — CA endpoint is the only trust source.
+            trusted_endpoints=trusted,
+        )
+    assert "@my/legit" in report.unaudited_allowed
+    assert "@my/typo" in report.unaudited_blocked
+    assert not report.clean
+
+
+def test_audit_backward_compat_no_ca_endpoints(tmp_path: Path) -> None:
+    # When trusted_endpoints is empty/None (v0.7.0 caller pattern), audit
+    # must behave identically: 404 on probe-private → HIGH unaudited_blocked.
+    lf = _write_lock(
+        tmp_path, {"node_modules/@my/internal-only": {"version": "1.0.0"}}
+    )
+
+    def mock_batch(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        return {"results": [{}]}
+
+    def mock_head(url: str, timeout: int, auth_header: str | None = None) -> int:
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_batch), patch(
+        "codeartifact_shield.audit._http_head_status", mock_head
+    ):
+        report = audit_lockfile(
+            lf, probe_registry="https://registry.npmjs.org"
+        )
+    assert "@my/internal-only" in report.unaudited_blocked
+    assert not report.clean
+
+
 def test_audit_allow_private_demotes_unaudited_to_info(tmp_path: Path) -> None:
     lf = _write_lock(
         tmp_path,
@@ -564,11 +704,11 @@ def test_audit_allow_private_demotes_unaudited_to_info(tmp_path: Path) -> None:
     def mock_batch(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
         return {"results": [{}, {}]}
 
-    def mock_get(url: str, timeout: int) -> dict[str, Any]:
+    def mock_head(url: str, timeout: int, auth_header: str | None = None) -> int:
         raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
 
     with patch("codeartifact_shield.audit._http_post_json", mock_batch), patch(
-        "codeartifact_shield.audit._http_get_json", mock_get
+        "codeartifact_shield.audit._http_head_status", mock_head
     ):
         report = audit_lockfile(
             lf,
@@ -578,6 +718,174 @@ def test_audit_allow_private_demotes_unaudited_to_info(tmp_path: Path) -> None:
     assert "@org/legit-internal" in report.unaudited_allowed
     assert "@org/typo" in report.unaudited_blocked
     assert not report.clean
+
+
+def test_audit_probe_parallel_dispatches_concurrently(tmp_path: Path) -> None:
+    """Performance: with N packages and 50ms simulated per-probe latency,
+    serial budget is N*50ms. Parallel with 20 workers must finish in
+    well under a quarter of that. Verifies the executor is actually
+    parallelising the probe phase.
+    """
+    import time
+
+    n_packages = 40
+    pkgs = {
+        f"node_modules/pkg-{i}": {"version": "1.0.0"} for i in range(n_packages)
+    }
+    lf = _write_lock(tmp_path, pkgs)
+
+    def mock_batch(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        return {"results": [{} for _ in body["queries"]]}
+
+    def slow_head(url: str, timeout: int, auth_header: str | None = None) -> int:
+        time.sleep(0.05)
+        return 200
+
+    start = time.monotonic()
+    with patch("codeartifact_shield.audit._http_post_json", mock_batch), patch(
+        "codeartifact_shield.audit._http_head_status", slow_head
+    ):
+        report = audit_lockfile(
+            lf,
+            probe_registry="https://registry.npmjs.org",
+            max_workers=20,
+        )
+    elapsed = time.monotonic() - start
+
+    serial_budget_seconds = n_packages * 0.05
+    assert elapsed < serial_budget_seconds / 3, (
+        f"probe parallelism broken: {elapsed:.2f}s elapsed, "
+        f"serial budget {serial_budget_seconds:.2f}s"
+    )
+    # All packages found on probe-registry → no findings.
+    assert report.clean
+
+
+def test_audit_probe_serial_when_max_workers_one(tmp_path: Path) -> None:
+    import time
+
+    pkgs = {
+        f"node_modules/pkg-{i}": {"version": "1.0.0"} for i in range(5)
+    }
+    lf = _write_lock(tmp_path, pkgs)
+
+    def mock_batch(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        return {"results": [{} for _ in body["queries"]]}
+
+    def slow_head(url: str, timeout: int, auth_header: str | None = None) -> int:
+        time.sleep(0.05)
+        return 200
+
+    start = time.monotonic()
+    with patch("codeartifact_shield.audit._http_post_json", mock_batch), patch(
+        "codeartifact_shield.audit._http_head_status", slow_head
+    ):
+        audit_lockfile(
+            lf, probe_registry="https://registry.npmjs.org", max_workers=1
+        )
+    elapsed = time.monotonic() - start
+    # 5 * 50ms = 250ms expected serial. Allow some scheduling slack.
+    assert elapsed >= 0.20, f"serial mode unexpectedly fast: {elapsed:.2f}s"
+
+
+def test_audit_probe_cache_hit_avoids_http(tmp_path: Path) -> None:
+    """When the probe cache has both packages cached, no HTTP HEAD is issued."""
+    lf = _write_lock(
+        tmp_path,
+        {
+            "node_modules/lodash": {"version": "4.17.21"},
+            "node_modules/@my/internal": {"version": "1.0.0"},
+        },
+    )
+    cache_file = tmp_path / "probe-cache.json"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "entries": {
+                    "probe-registry": {
+                        "lodash": "found",
+                        "@my/internal": "404",
+                    }
+                },
+            }
+        )
+    )
+
+    def mock_batch(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        return {"results": [{}, {}]}
+
+    def mock_head(url: str, timeout: int, auth_header: str | None = None) -> int:
+        raise AssertionError("HEAD must not be called on full cache hit")
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_batch), patch(
+        "codeartifact_shield.audit._http_head_status", mock_head
+    ):
+        report = audit_lockfile(
+            lf,
+            probe_registry="https://registry.npmjs.org",
+            probe_cache_path=cache_file,
+        )
+    # lodash found → no finding; @my/internal 404 → blocked.
+    assert "@my/internal" in report.unaudited_blocked
+
+
+def test_audit_probe_cache_miss_persists(tmp_path: Path) -> None:
+    """A first run with no cache writes results for both 200s and 404s."""
+    lf = _write_lock(
+        tmp_path,
+        {
+            "node_modules/lodash": {"version": "4.17.21"},
+            "node_modules/@my/internal": {"version": "1.0.0"},
+        },
+    )
+    cache_file = tmp_path / "probe-cache.json"
+
+    def mock_batch(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        return {"results": [{}, {}]}
+
+    def mock_head(url: str, timeout: int, auth_header: str | None = None) -> int:
+        if url.endswith("/lodash"):
+            return 200
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_batch), patch(
+        "codeartifact_shield.audit._http_head_status", mock_head
+    ):
+        audit_lockfile(
+            lf,
+            probe_registry="https://registry.npmjs.org",
+            probe_cache_path=cache_file,
+        )
+    persisted = json.loads(cache_file.read_text())
+    assert persisted["schema_version"] == 1
+    assert persisted["entries"]["probe-registry"]["lodash"] == "found"
+    assert persisted["entries"]["probe-registry"]["@my/internal"] == "404"
+
+
+def test_audit_corrupt_probe_cache_falls_back(tmp_path: Path) -> None:
+    lf = _write_lock(tmp_path, {"node_modules/lodash": {"version": "4.17.21"}})
+    cache_file = tmp_path / "probe-cache.json"
+    cache_file.write_text("{not valid json")
+
+    def mock_batch(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+        return {"results": [{}]}
+
+    def mock_head(url: str, timeout: int, auth_header: str | None = None) -> int:
+        return 200
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_batch), patch(
+        "codeartifact_shield.audit._http_head_status", mock_head
+    ):
+        report = audit_lockfile(
+            lf,
+            probe_registry="https://registry.npmjs.org",
+            probe_cache_path=cache_file,
+        )
+    assert report.clean
+    # Cache re-written cleanly.
+    persisted = json.loads(cache_file.read_text())
+    assert persisted["schema_version"] == 1
 
 
 def test_audit_real_auditjs_fixture_loads(tmp_path: Path) -> None:

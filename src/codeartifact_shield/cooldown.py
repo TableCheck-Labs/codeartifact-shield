@@ -50,6 +50,26 @@ from pathlib import Path
 from typing import Any
 
 from codeartifact_shield._lockfile import extract_package_name, load_lockfile
+from codeartifact_shield._registry import (
+    RegistryEndpoint,
+    build_codeartifact_endpoint,
+    package_url,
+)
+
+# Re-export so existing `from codeartifact_shield.cooldown import RegistryEndpoint`
+# imports keep working after the refactor.
+__all__ = [
+    "DEFAULT_MAX_WORKERS",
+    "DEFAULT_MIN_AGE_DAYS",
+    "DEFAULT_REGISTRY",
+    "CooldownFinding",
+    "CooldownReport",
+    "RegistryEndpoint",
+    "build_codeartifact_endpoint",
+    "check_cooldown",
+    "load_cache",
+    "save_cache",
+]
 
 DEFAULT_REGISTRY = "https://registry.npmjs.org"
 DEFAULT_MIN_AGE_DAYS = 14
@@ -108,18 +128,6 @@ class CooldownReport:
         )
 
 
-@dataclass
-class RegistryEndpoint:
-    url: str
-    auth_header: str | None = None
-    label: str = ""
-
-    def __post_init__(self) -> None:
-        if not self.label:
-            parsed = urllib.parse.urlparse(self.url)
-            self.label = parsed.netloc or self.url
-
-
 def _http_get_json(
     url: str, timeout: int, auth_header: str | None = None
 ) -> dict[str, Any]:
@@ -132,49 +140,10 @@ def _http_get_json(
         return payload
 
 
-def _package_url(endpoint: RegistryEndpoint, package_name: str) -> str:
-    base = endpoint.url.rstrip("/")
-    return f"{base}/{urllib.parse.quote(package_name, safe='@')}"
-
-
 def _parse_iso8601(value: str) -> datetime:
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
     return datetime.fromisoformat(value)
-
-
-def build_codeartifact_endpoint(
-    domain: str,
-    repository: str,
-    domain_owner: str | None = None,
-    region: str | None = None,
-) -> RegistryEndpoint:
-    """Construct a CodeArtifact npm endpoint with a fresh bearer token."""
-    import boto3
-
-    client = boto3.client("codeartifact", region_name=region)
-    if domain_owner:
-        token_resp = client.get_authorization_token(
-            domain=domain, domainOwner=domain_owner
-        )
-        endpoint_resp = client.get_repository_endpoint(
-            domain=domain,
-            domainOwner=domain_owner,
-            repository=repository,
-            format="npm",
-        )
-    else:
-        token_resp = client.get_authorization_token(domain=domain)
-        endpoint_resp = client.get_repository_endpoint(
-            domain=domain, repository=repository, format="npm"
-        )
-    token = token_resp["authorizationToken"]
-    endpoint_url = endpoint_resp["repositoryEndpoint"].rstrip("/")
-    return RegistryEndpoint(
-        url=endpoint_url,
-        auth_header=f"Bearer {token}",
-        label=urllib.parse.urlparse(endpoint_url).netloc,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +218,7 @@ class _FetchResult:
 def _fetch_one(
     endpoint: RegistryEndpoint, name: str, timeout: int
 ) -> _FetchResult:
-    url = _package_url(endpoint, name)
+    url = package_url(endpoint, name)
     try:
         metadata = _http_get_json(url, timeout=timeout, auth_header=endpoint.auth_header)
         return _FetchResult(name=name, status="ok", metadata=metadata)

@@ -555,12 +555,31 @@ cas audit [OPTIONS] LOCKFILE
 | Flag                | Behavior                                                                                                                                                                                                                                                                  |
 | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--allow TEXT`         | Vuln ID (`GHSA-...`, `CVE-...`, `OSV-...`) to suppress. Repeatable. Matched case-insensitively against the primary id **and** each alias. Env: `CAS_AUDIT_ALLOW`.                                                                                                          |
-| `--allow-private TEXT` | Package name (with scope) permitted to be unauditable. Demotes `unaudited_private` HIGH → INFO for that name. Only meaningful with `--probe-private`. Repeatable. Env: `CAS_AUDIT_ALLOW_PRIVATE`.                                                                          |
-| `--min-severity SEV`   | Only report findings at or above this severity. Choices: `critical`, `high`, `medium`/`moderate`, `low`. Default: report all.                                                                                                                                              |
-| `--whitelist FILE`     | Path to a whitelist file. Two formats accepted (see below). Env: `CAS_AUDIT_WHITELIST`. IDs from the file are merged with `--allow` flags.                                                                                                                                  |
-| `--probe-private URL`  | Public-registry URL to detect packages not covered by OSV. Each unhit package gets one extra `GET <url>/<name>`; any 404 is surfaced as `unaudited_private` (HIGH by default — see "Secure by default" below). Recommended: `https://registry.npmjs.org`. Env: `CAS_AUDIT_PROBE_REGISTRY`. |
-| `--json`               | Machine-readable JSON on stdout instead of human text.                                                                                                                                                                                                                      |
-| `-h`, `--help`         | Show help.                                                                                                                                                                                                                                                                  |
+| `--allow-private TEXT`   | Package name (with scope) permitted to be unauditable. Demotes `unaudited_private` HIGH → INFO. Only meaningful with `--probe-private`. Repeatable. Shared with `cas cooldown` via `CAS_ALLOW_PRIVATE`. Prefer `--ca-domain` over enumerating package names.                |
+| `--min-severity SEV`     | Only report findings at or above this severity. Choices: `critical`, `high`, `medium`/`moderate`, `low`. Default: report all.                                                                                                                                              |
+| `--whitelist FILE`       | Path to a whitelist file. Two formats accepted (see below). Env: `CAS_AUDIT_WHITELIST`. IDs from the file are merged with `--allow` flags.                                                                                                                                  |
+| `--probe-private URL`    | Public-registry URL to detect packages not covered by OSV. Parallel HEAD against this URL; 404 falls through to `--ca-domain` (if configured) before being flagged `unaudited_private` HIGH. Recommended: `https://registry.npmjs.org`. Env: `CAS_AUDIT_PROBE_REGISTRY`.    |
+| `--ca-domain DOMAIN`     | CodeArtifact domain. When set, packages 404'ing on `--probe-private` are probed against the CA endpoint (bearer token via boto3). A hit demotes the finding to INFO — saves enumerating private package names. Env: `CAS_DOMAIN`.                                          |
+| `--ca-repository REPO`   | CodeArtifact repository. Required with `--ca-domain`. Env: `CAS_REPOSITORY`.                                                                                                                                                                                                |
+| `--ca-domain-owner ACCT` | CodeArtifact domain-owner AWS account ID. Optional. Env: `CAS_DOMAIN_OWNER`.                                                                                                                                                                                                |
+| `--max-workers N`        | Thread-pool size for parallel HEAD probes and OSV vuln-detail fetches. Default 20. Env: `CAS_AUDIT_MAX_WORKERS`.                                                                                                                                                            |
+| `--probe-cache PATH`     | JSON cache of probe results across CI runs. Entries never invalidate. A fully-cached audit completes in <10s on a 2500-package lockfile. Env: `CAS_AUDIT_PROBE_CACHE`.                                                                                                      |
+| `--json`                 | Machine-readable JSON on stdout instead of human text.                                                                                                                                                                                                                      |
+| `-h`, `--help`           | Show help.                                                                                                                                                                                                                                                                  |
+
+### Performance
+
+`cas audit` parallelises the `--probe-private` phase and OSV
+vuln-detail fetches via `ThreadPoolExecutor`. Probes use HTTP HEAD —
+no body transferred. With `--probe-cache`, package-existence results
+persist across runs. Measured on a 2500-package lockfile, public-npm
+probe + CA fallback:
+
+| Mode                                  | Wall time     |
+| ------------------------------------- | ------------- |
+| First run, parallel HEAD              | ~15–20 sec    |
+| First run, serial (`--max-workers 1`) | ~3–4 minutes  |
+| Cached run                            | <10 sec       |
 
 ### Secure by default — unaudited private packages
 
@@ -579,6 +598,15 @@ Use `--allow-private <name>` to demote trusted org-internal packages
 to INFO. Combined recipe for a CodeArtifact-proxied project:
 
 ```bash
+# Recommended for CodeArtifact-proxied projects: CA vouches for all your
+# private scopes at once, no per-name enumeration needed.
+cas audit ./package-lock.json \
+  --whitelist ./auditjs.json \
+  --probe-private https://registry.npmjs.org \
+  --ca-domain my-domain --ca-repository my-repo \
+  --probe-cache .cas-audit-probe-cache.json
+
+# Without CA: enumerate trusted internal scopes individually.
 cas audit ./package-lock.json \
   --whitelist ./auditjs.json \
   --probe-private https://registry.npmjs.org \
@@ -708,7 +736,7 @@ cas cooldown [OPTIONS] LOCKFILE
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `--min-age DAYS`        | Minimum age in days. Versions younger than this fail the gate. Default `14`. Env: `CAS_COOLDOWN_MIN_AGE`.                                                                                                                                                          |
 | `--allow TEXT`          | Package name (including scope) permitted to ship without a cooldown delay. Repeatable. Env: `CAS_COOLDOWN_ALLOW`.                                                                                                                                                  |
-| `--allow-private TEXT`  | Package name permitted to be unresolvable on every configured registry (see "Secure by default" below). Repeatable. Env: `CAS_COOLDOWN_ALLOW_PRIVATE`.                                                                                                            |
+| `--allow-private TEXT`  | Package name permitted to be unresolvable on every configured registry (see "Secure by default" below). Repeatable. Shared with `cas audit` via `CAS_ALLOW_PRIVATE`.                                                                                              |
 | `--registry URL`        | Primary registry to query for publish times. Default `https://registry.npmjs.org`. Env: `CAS_COOLDOWN_REGISTRY`.                                                                                                                                                   |
 | `--ca-domain DOMAIN`    | CodeArtifact domain. When set, cas queries the CA npm endpoint with a fresh bearer token (boto3). Required for CodeArtifact-only private packages. Env: `CAS_DOMAIN`.                                                                                              |
 | `--ca-repository REPO`  | CodeArtifact repository name. Required when `--ca-domain` is set. Env: `CAS_REPOSITORY`.                                                                                                                                                                          |
@@ -868,10 +896,11 @@ the check is consistent everywhere.
 | `CAS_AUDIT_ALLOW`         | `cas audit`          | Whitespace-separated default for `--allow`.                 |
 | `CAS_AUDIT_WHITELIST`     | `cas audit`          | Default path for `--whitelist`.                             |
 | `CAS_AUDIT_PROBE_REGISTRY`| `cas audit`          | Default for `--probe-private`.                              |
-| `CAS_AUDIT_ALLOW_PRIVATE` | `cas audit`          | Whitespace-separated default for `--allow-private`.         |
+| `CAS_AUDIT_MAX_WORKERS`   | `cas audit`          | Default for `--max-workers`.                                |
+| `CAS_AUDIT_PROBE_CACHE`   | `cas audit`          | Default path for `--probe-cache`.                           |
 | `CAS_COOLDOWN_MIN_AGE`    | `cas cooldown`       | Default for `--min-age`.                                    |
 | `CAS_COOLDOWN_ALLOW`      | `cas cooldown`       | Whitespace-separated default for `--allow`.                 |
-| `CAS_COOLDOWN_ALLOW_PRIVATE` | `cas cooldown`    | Whitespace-separated default for `--allow-private`.         |
+| `CAS_ALLOW_PRIVATE`       | `cas audit`, `cas cooldown` | Whitespace-separated default for `--allow-private`. Shared across both commands. |
 | `CAS_COOLDOWN_REGISTRY`   | `cas cooldown`       | Default for `--registry`.                                   |
 | `CAS_COOLDOWN_CACHE`      | `cas cooldown`       | Default path for `--cache`.                                 |
 | `CAS_COOLDOWN_MAX_WORKERS`| `cas cooldown`       | Default for `--max-workers`.                                |
@@ -919,7 +948,13 @@ A complete gate looks like this (Semaphore CI):
       - name: Audit
         commands:
           - source ./.semaphore/commands/install-cas.sh
-          - cas audit ./package-lock.json --whitelist ./auditjs.json --min-severity high
+          - >-
+            cas audit ./package-lock.json
+            --whitelist ./auditjs.json
+            --min-severity high
+            --probe-private https://registry.npmjs.org
+            --ca-domain my-domain --ca-repository my-repo
+            --probe-cache .cas-audit-probe-cache.json
       - name: Cooldown
         commands:
           - source ./.semaphore/commands/install-cas.sh
