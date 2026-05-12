@@ -1,0 +1,69 @@
+[project]
+name = "codeartifact-shield"
+version = "0.1.0"
+description = "npm supply-chain hardening for AWS CodeArtifact: backfills the SRI integrity hashes CodeArtifact strips from package-lock.json, and fails the build on package.json/lockfile drift."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Alexander Nicholson" }]
+keywords = ["codeartifact", "npm", "supply-chain", "sri", "security", "lockfile"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Software Development :: Build Tools",
+]
+
+# Pinned with ==. This tool exists to fight supply-chain risk; it would be
+# embarrassing to ship it with floppy version ranges. Update by bumping a
+# literal and regenerating any downstream lock.
+dependencies = [
+    "boto3==1.43.6",
+    "click==8.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.5",
+    "pytest-cov==6.0.0",
+    "ruff==0.12.2",
+    "mypy==1.18.2",
+    "boto3-stubs[codeartifact]==1.43.6",
+]
+
+[project.scripts]
+cas = "codeartifact_shield.cli:main"
+codeartifact-shield = "codeartifact_shield.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/alexandernicholson/codeartifact-shield"
+Issues = "https://github.com/alexandernicholson/codeartifact-shield/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codeartifact_shield"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
