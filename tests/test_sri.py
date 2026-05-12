@@ -214,3 +214,133 @@ def test_verify_lockfile_rejects_v1(tmp_path: Path) -> None:
     lockfile.write_text(json.dumps({"lockfileVersion": 1, "dependencies": {}}))
     with pytest.raises(ValueError, match="unsupported lockfileVersion"):
         verify_lockfile(lockfile)
+
+
+# ---------------------------------------------------------------------------
+# G1 — bundleDependencies are integrity-anchored by the parent's hash.
+#
+# Threat model: at install time npm re-derives `inDepBundle` from the
+# *parent's* package.json (which lives inside the parent's tarball, which
+# is itself integrity-pinned). Tampering with the lockfile's `inBundle: true`
+# flag has no install-time effect. So a bundled child whose parent has
+# integrity is cryptographically covered — but a bundled child whose
+# parent has no integrity is an orphan and must fail closed.
+# ---------------------------------------------------------------------------
+
+_VALID_SRI = "sha512-" + ("a" * 86) + "=="
+
+
+def _write_lock(tmp_path: Path, packages: dict[str, dict[str, Any]]) -> Path:
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text(
+        json.dumps({"lockfileVersion": 3, "packages": packages}, indent=2)
+    )
+    return lockfile
+
+
+def test_verify_counts_bundled_via_parent_integrity_as_covered(tmp_path: Path) -> None:
+    """A bundled child whose parent has integrity is covered transitively."""
+    lockfile = _write_lock(
+        tmp_path,
+        {
+            "node_modules/parent": {
+                "version": "1.0.0",
+                "resolved": "https://r/parent.tgz",
+                "integrity": _VALID_SRI,
+            },
+            "node_modules/parent/node_modules/bundled-child": {
+                "version": "2.0.0",
+                "inBundle": True,
+            },
+        },
+    )
+    covered, total = verify_lockfile(lockfile)
+    assert total == 2, "bundled child must still be counted in the denominator"
+    assert covered == 2, "bundled child must count as covered via parent integrity"
+
+
+def test_verify_bundled_without_parent_integrity_fails_closed(tmp_path: Path) -> None:
+    """If parent has no integrity, the bundled child cannot be trusted."""
+    lockfile = _write_lock(
+        tmp_path,
+        {
+            "node_modules/parent": {
+                "version": "1.0.0",
+                # No resolved, no integrity — e.g. git source, file source.
+            },
+            "node_modules/parent/node_modules/bundled-orphan": {
+                "version": "2.0.0",
+                "inBundle": True,
+            },
+        },
+    )
+    covered, total = verify_lockfile(lockfile)
+    assert total == 2
+    assert covered == 0, "no trust root exists; both entries are uncovered"
+
+
+def test_verify_bundled_transitive_chain(tmp_path: Path) -> None:
+    """A -> bundles B -> bundles C. C is covered iff A has integrity."""
+    lockfile = _write_lock(
+        tmp_path,
+        {
+            "node_modules/a": {
+                "version": "1.0.0",
+                "resolved": "https://r/a.tgz",
+                "integrity": _VALID_SRI,
+            },
+            "node_modules/a/node_modules/b": {
+                "version": "2.0.0",
+                "inBundle": True,
+            },
+            "node_modules/a/node_modules/b/node_modules/c": {
+                "version": "3.0.0",
+                "inBundle": True,
+            },
+        },
+    )
+    covered, total = verify_lockfile(lockfile)
+    assert total == 3
+    assert covered == 3, "the chain anchors to A's integrity"
+
+
+def test_verify_bundled_chain_breaks_when_top_lacks_integrity(tmp_path: Path) -> None:
+    """If the chain's anchor (top of bundle ancestry) has no integrity, nothing is covered."""
+    lockfile = _write_lock(
+        tmp_path,
+        {
+            "node_modules/a": {
+                "version": "1.0.0",
+                # No integrity — chain broken at root.
+            },
+            "node_modules/a/node_modules/b": {
+                "version": "2.0.0",
+                "inBundle": True,
+            },
+            "node_modules/a/node_modules/b/node_modules/c": {
+                "version": "3.0.0",
+                "inBundle": True,
+            },
+        },
+    )
+    covered, total = verify_lockfile(lockfile)
+    assert total == 3
+    assert covered == 0
+
+
+def test_verify_inBundle_at_top_level_uncovered(tmp_path: Path) -> None:
+    """`inBundle: true` at top-level node_modules (no parent in nm) is suspicious — fail closed."""
+    lockfile = _write_lock(
+        tmp_path,
+        {
+            "node_modules/rogue-bundled": {
+                "version": "1.0.0",
+                "inBundle": True,
+                # No parent in node_modules — bundleDependencies relationship
+                # cannot be cryptographically anchored.
+            },
+        },
+    )
+    covered, total = verify_lockfile(lockfile)
+    assert total == 1
+    assert covered == 0, "top-level inBundle has no parent to anchor to"

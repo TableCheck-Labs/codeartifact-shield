@@ -111,7 +111,12 @@ def _ref_from_lockfile_key(key: str) -> PackageRef | None:
 def _iter_lockfile_packages(lock: dict[str, Any]) -> Iterable[tuple[str, dict[str, Any]]]:
     """Yield ``(lockfile_key, entry)`` pairs for installable packages.
 
-    Skips the root entry (the empty key) which represents the project itself.
+    Skips the root entry (the empty key) which represents the project itself,
+    and workspace symlinks (which don't represent a fetched artifact).
+
+    Bundled entries (``inBundle: true``) ARE yielded — they're counted in the
+    denominator but their integrity coverage comes via the parent's hash; see
+    :func:`_is_integrity_covered`.
     """
     pkgs = lock.get("packages", {})
     for key, entry in pkgs.items():
@@ -121,9 +126,66 @@ def _iter_lockfile_packages(lock: dict[str, Any]) -> Iterable[tuple[str, dict[st
             # Workspace symlinks aren't fetched from a registry.
             continue
         if not entry.get("version"):
-            # Some entries are bundled-only or workspace-only.
+            # Workspace-only entries with no installed artifact.
             continue
         yield key, entry
+
+
+def _parent_lockfile_key(key: str) -> str | None:
+    """Return the parent lockfile key for a nested ``node_modules`` path.
+
+    Examples::
+
+        node_modules/foo/node_modules/bar         -> node_modules/foo
+        node_modules/@scope/x/node_modules/y      -> node_modules/@scope/x
+        node_modules/foo                          -> None  (top level)
+
+    Top-level entries have no parent inside ``node_modules`` so the function
+    returns ``None``. Callers must treat that as "no trust root."
+    """
+    marker = "/node_modules/"
+    idx = key.rfind(marker)
+    if idx <= 0:
+        return None
+    return key[:idx]
+
+
+def _is_integrity_covered(
+    key: str,
+    entry: dict[str, Any],
+    pkgs: dict[str, dict[str, Any]],
+    _seen: frozenset[str] = frozenset(),
+) -> bool:
+    """An entry's bytes are integrity-covered iff:
+
+    1. It has its own ``integrity`` field (covers the bytes fetched from
+       ``resolved``), OR
+    2. It is marked ``inBundle: true`` AND its parent in the lockfile tree
+       is itself integrity-covered. Recursively — a deep bundle chain
+       anchors to the topmost non-bundled ancestor's hash.
+
+    Why (2) is sound: npm at install time re-derives the bundle relationship
+    from the parent's ``package.json`` (which lives inside the parent's
+    tarball, which is verified by the parent's ``integrity``). An attacker
+    cannot fake ``inBundle: true`` to escape integrity gating without also
+    arranging a parent whose hash anchors the real ``bundleDependencies``
+    list — and forging that hash would require breaking SHA-512.
+    """
+    if entry.get("integrity"):
+        return True
+    if not entry.get("inBundle"):
+        return False
+    if key in _seen:  # pragma: no cover — defensive against malformed lockfiles
+        return False
+    parent_key = _parent_lockfile_key(key)
+    if parent_key is None:
+        # Top-level node_modules entry claiming `inBundle: true` has no
+        # parent to anchor against — suspicious. Fail closed.
+        return False
+    parent = pkgs.get(parent_key)
+    if parent is None:
+        return False
+    return _is_integrity_covered(parent_key, parent, pkgs, _seen | {key})
 
 
 def sri_from_sha512_hex(hex_digest: str) -> str:
@@ -234,7 +296,12 @@ def patch_lockfile(
 
 
 def verify_lockfile(lockfile_path: Path) -> tuple[int, int]:
-    """Return ``(with_integrity, total)`` for installable lockfile entries.
+    """Return ``(covered, total)`` for installable lockfile entries.
+
+    *Covered* means the entry's bytes are integrity-anchored — either by
+    its own ``integrity`` field, or transitively (it's a bundleDependencies
+    child whose parent is itself covered). See :func:`_is_integrity_covered`
+    for the security argument.
 
     Doesn't talk to CodeArtifact — pure lockfile read. The CLI uses this
     as the basis for a fail-on-missing-SRI gate.
@@ -248,10 +315,11 @@ def verify_lockfile(lockfile_path: Path) -> tuple[int, int]:
         raise ValueError(
             f"unsupported lockfileVersion {lf_version}; only v2 and v3 are supported"
         )
+    pkgs: dict[str, dict[str, Any]] = lock.get("packages", {})
     total = 0
-    with_integrity = 0
-    for _key, entry in _iter_lockfile_packages(lock):
+    covered = 0
+    for key, entry in _iter_lockfile_packages(lock):
         total += 1
-        if entry.get("integrity"):
-            with_integrity += 1
-    return with_integrity, total
+        if _is_integrity_covered(key, entry, pkgs):
+            covered += 1
+    return covered, total
