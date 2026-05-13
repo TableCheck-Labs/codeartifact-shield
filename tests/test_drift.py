@@ -167,6 +167,83 @@ def test_bundled_entries_are_not_orphans(tmp_path: Path) -> None:
     assert report.orphan_entries == []
 
 
+def test_bundled_entries_transitive_deps_are_not_orphans(tmp_path: Path) -> None:
+    """Regression: v0.7.2 short-circuited the bundleDeps walk and flagged a
+    bundled child's transitive tree as orphans. Mirrors the
+    @semantic-release/npm@9 case where the bundled npm CLI has ~137 nested
+    deps inside node_modules/npm/node_modules/*."""
+    root = _write_pair(
+        tmp_path,
+        {"dependencies": {"@semantic-release/npm": "9.0.2"}},
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"dependencies": {"@semantic-release/npm": "9.0.2"}},
+                "node_modules/@semantic-release/npm": {
+                    "version": "9.0.2",
+                    "bundleDependencies": ["npm"],
+                },
+                "node_modules/@semantic-release/npm/node_modules/npm": {
+                    "version": "9.5.0",
+                    "inBundle": True,
+                    "dependencies": {
+                        "lodash": "4.17.21",
+                        "semver": "7.5.4",
+                    },
+                },
+                "node_modules/@semantic-release/npm/node_modules/npm/node_modules/lodash": {
+                    "version": "4.17.21",
+                    "inBundle": True,
+                },
+                "node_modules/@semantic-release/npm/node_modules/npm/node_modules/semver": {
+                    "version": "7.5.4",
+                    "inBundle": True,
+                    "dependencies": {"lru-cache": "6.0.0"},
+                },
+                (
+                    "node_modules/@semantic-release/npm/node_modules/npm/"
+                    "node_modules/semver/node_modules/lru-cache"
+                ): {
+                    "version": "6.0.0",
+                    "inBundle": True,
+                },
+            },
+        },
+    )
+    report = check_npm_drift(root)
+    assert report.orphan_entries == []
+
+
+def test_nested_bundle_inside_bundle_is_not_orphan(tmp_path: Path) -> None:
+    """A bundleDependencies entry that itself declares bundleDependencies
+    must also have its bundle walked."""
+    root = _write_pair(
+        tmp_path,
+        {"dependencies": {"outer": "1.0.0"}},
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"dependencies": {"outer": "1.0.0"}},
+                "node_modules/outer": {
+                    "version": "1.0.0",
+                    "bundleDependencies": ["mid"],
+                },
+                "node_modules/outer/node_modules/mid": {
+                    "version": "1.0.0",
+                    "inBundle": True,
+                    "bundleDependencies": ["inner"],
+                },
+                "node_modules/outer/node_modules/mid/node_modules/inner": {
+                    "version": "1.0.0",
+                    "inBundle": True,
+                },
+            },
+        },
+    )
+    report = check_npm_drift(root)
+    assert report.orphan_entries == []
+
+
 def test_dev_deps_are_reachable(tmp_path: Path) -> None:
     """devDependencies entries (e.g. eslint) must not be flagged as orphans."""
     root = _write_pair(

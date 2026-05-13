@@ -270,13 +270,8 @@ def _find_orphan_entries(
         for kind in ("dependencies", "peerDependencies", "optionalDependencies"):
             for grandchild_name in entry.get(kind, {}):
                 queue.append((child_key, grandchild_name))
-        # bundleDependencies are nested by name under the parent's node_modules.
         for bundled_name in entry.get("bundleDependencies", []) or []:
-            bundled_key = f"{child_key}/node_modules/{bundled_name}"
-            if bundled_key in lock_pkgs and bundled_key not in reachable:
-                reachable.add(bundled_key)
-                # Walk the bundled entry's own declared deps too.
-                queue.append((child_key, bundled_name))
+            queue.append((child_key, bundled_name))
 
     orphans: list[str] = []
     for key, entry in lock_pkgs.items():
