@@ -435,7 +435,7 @@ cas scripts [OPTIONS] LOCKFILE
 
 | Flag              | Behavior                                                                                          |
 | ----------------- | ------------------------------------------------------------------------------------------------- |
-| `--allow TEXT`    | Package name (including scope, e.g. `@parcel/watcher`) permitted to run install scripts. Repeatable. Env: `CAS_ALLOWED_SCRIPTS` (whitespace-separated). |
+| `--allow TEXT`    | Package permitted to run install scripts. Accepts `name` or `name@version` (see [Versioned allowlist syntax](#versioned-allowlist-syntax)). Repeatable. Env: `CAS_ALLOWED_SCRIPTS` (whitespace-separated). |
 | `--json`          | Machine-readable JSON on stdout instead of human text.                                            |
 | `-h`, `--help`    | Show help.                                                                                        |
 
@@ -581,7 +581,7 @@ cas audit [OPTIONS] LOCKFILE
 | Flag                | Behavior                                                                                                                                                                                                                                                                  |
 | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--allow TEXT`         | Vuln ID (`GHSA-...`, `CVE-...`, `OSV-...`) to suppress. Repeatable. Matched case-insensitively against the primary id **and** each alias. Env: `CAS_AUDIT_ALLOW`.                                                                                                          |
-| `--allow-private TEXT`   | Package name (with scope) permitted to be unauditable. Demotes `unaudited_private` HIGH → INFO. Only meaningful with `--probe-private`. Repeatable. Shared with `cas cooldown` via `CAS_ALLOW_PRIVATE`. Prefer `--ca-domain` over enumerating package names.                |
+| `--allow-private TEXT`   | Package permitted to be unauditable. Accepts `name` or `name@version` (see [Versioned allowlist syntax](#versioned-allowlist-syntax)). Demotes `unaudited_private` HIGH → INFO. Only meaningful with `--probe-private`. Repeatable. Shared with `cas cooldown` via `CAS_ALLOW_PRIVATE`. Prefer `--ca-domain` over enumerating package names.                |
 | `--min-severity SEV`     | Only report findings at or above this severity. Choices: `critical`, `high`, `medium`/`moderate`, `low`. Default: report all.                                                                                                                                              |
 | `--whitelist FILE`       | Path to a whitelist file. Two formats accepted (see below). Env: `CAS_AUDIT_WHITELIST`. IDs from the file are merged with `--allow` flags.                                                                                                                                  |
 | `--probe-private URL`    | Public-registry URL to detect packages not covered by OSV. Parallel HEAD against this URL; 404 falls through to `--ca-domain` (if configured) before being flagged `unaudited_private` HIGH. Recommended: `https://registry.npmjs.org`. Env: `CAS_AUDIT_PROBE_REGISTRY`.    |
@@ -782,12 +782,30 @@ type `audit_network_error` and exits `1` — never silently returns
       "vuln_severity": "HIGH",
       "summary": "Serialize JavaScript is Vulnerable to RCE...",
       "fixed_in": "7.0.3",
-      "aliases": ["CVE-2024-11831"]
+      "aliases": ["CVE-2024-11831"],
+      "source": "https://api.osv.dev"
+    },
+    {
+      "severity": "HIGH",
+      "type": "unaudited_private",
+      "package": "@my/internal",
+      "version": "1.0.0"
     }
   ],
-  "severity_counts": {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+  "severity_counts": {"CRITICAL": 0, "HIGH": 2, "MEDIUM": 0, "LOW": 0, "INFO": 0}
 }
 ```
+
+`source` is the OSV endpoint URL that surfaced the finding. Present only
+when `--osv-endpoint` is in use (with the default single-endpoint setup
+the field is omitted for back-compat).
+
+> **Migration note (v0.8.0):** `unaudited_private` and
+> `unaudited_private_allowed` entries gained a `version` field. Their
+> shape changed from name-only (`{package: "..."}`) to per-pair
+> (`{package: "...", version: "..."}`). Required so versioned
+> `--allow-private` entries can be applied surgically. Update any
+> consumer that parses these.
 
 ---
 
@@ -807,8 +825,8 @@ cas cooldown [OPTIONS] LOCKFILE
 | Flag                    | Behavior                                                                                                                                                                                                                                                          |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `--min-age DAYS`        | Minimum age in days. Versions younger than this fail the gate. Default `14`. Env: `CAS_COOLDOWN_MIN_AGE`.                                                                                                                                                          |
-| `--allow TEXT`          | Package name (including scope) permitted to ship without a cooldown delay. Repeatable. Env: `CAS_COOLDOWN_ALLOW`.                                                                                                                                                  |
-| `--allow-private TEXT`  | Package name permitted to be unresolvable on every configured registry (see "Secure by default" below). Repeatable. Shared with `cas audit` via `CAS_ALLOW_PRIVATE`.                                                                                              |
+| `--allow TEXT`          | Package permitted to ship without a cooldown delay. Accepts `name` or `name@version` (see [Versioned allowlist syntax](#versioned-allowlist-syntax)). Repeatable. Env: `CAS_COOLDOWN_ALLOW`.                                                                       |
+| `--allow-private TEXT`  | Package permitted to be unresolvable on every configured registry. Accepts `name` or `name@version` (see [Versioned allowlist syntax](#versioned-allowlist-syntax)). Repeatable. Shared with `cas audit` via `CAS_ALLOW_PRIVATE`.                                  |
 | `--registry URL`        | Primary registry to query for publish times. Default `https://registry.npmjs.org`. Env: `CAS_COOLDOWN_REGISTRY`.                                                                                                                                                   |
 | `--ca-domain DOMAIN`    | CodeArtifact domain. When set, cas queries the CA npm endpoint with a fresh bearer token (boto3). Required for CodeArtifact-only private packages. Env: `CAS_DOMAIN`.                                                                                              |
 | `--ca-repository REPO`  | CodeArtifact repository name. Required when `--ca-domain` is set. Env: `CAS_REPOSITORY`.                                                                                                                                                                          |
