@@ -49,6 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from codeartifact_shield._allowlist import PackageAllowlist
 from codeartifact_shield._http import DEFAULT_RETRIES, with_retry
 from codeartifact_shield._lockfile import extract_package_name, load_lockfile
 from codeartifact_shield._registry import (
@@ -336,8 +337,8 @@ def check_cooldown(
             continue
         pending[(name, version)] = None
 
-    allowlist = {n.lower() for n in allowed}
-    private_allowlist = {n.lower() for n in allow_private}
+    allowlist = PackageAllowlist.from_entries(allowed)
+    private_allowlist = PackageAllowlist.from_entries(allow_private)
     report = CooldownReport(total_checked=len(pending))
 
     cache: PublishCache = load_cache(cache_path) if cache_path else {}
@@ -361,7 +362,7 @@ def check_cooldown(
             age_days=round(age_days, 2),
             source=source,
         )
-        if name.lower() in allowlist:
+        if allowlist.allows(name, version):
             report.allowed.append(finding)
         else:
             report.flagged.append(finding)
@@ -439,7 +440,7 @@ def check_cooldown(
             # treating as private_blocked.
             report.network_errors.append(pending_errors[name])
             continue
-        if name.lower() in private_allowlist:
+        if private_allowlist.allows(name, version):
             report.private_allowed.append(nv_label)
         else:
             report.private_blocked.append(nv_label)

@@ -41,6 +41,32 @@ Every command:
 
 ---
 
+## Versioned allowlist syntax
+
+Every `--allow` / `--allow-private` flag (on `cas cooldown`, `cas audit`,
+`cas scripts`) accepts two forms, mixable within the same list:
+
+| Entry | Matches |
+| --- | --- |
+| `name` | Every installed version of the package. |
+| `name@version` | Only that exact version. |
+
+Examples:
+
+```bash
+# Permit every version of @internal/lib but only one specific lodash:
+cas cooldown ./package-lock.json \
+  --allow @internal/lib --allow lodash@4.17.21
+
+# Allow install scripts only for the pinned esbuild version:
+cas scripts ./package-lock.json --allow esbuild@0.20.2
+```
+
+Name matching is case-insensitive (npm normalises on publish). Version
+matching is exact and case-sensitive (SemVer prerelease identifiers are
+significant). Scoped packages are parsed correctly — `@scope/pkg@1.0.0`
+splits to `("@scope/pkg", "1.0.0")`.
+
 ## Severity ladder
 
 | Severity | Type                                  | Meaning                                                        |
@@ -103,19 +129,19 @@ The package isn't on PyPI. Install directly from GitHub, **pinned to a
 specific commit SHA**:
 
 ```bash
-pip install "git+https://github.com/TableCheck-Labs/codeartifact-shield.git@<sha>"
+pip install "git+https://github.com/alexandernicholson/codeartifact-shield.git@<sha>"
 ```
 
 Floating refs (`@main`, `@v0.4.0` as a tag) are technically supported but
 should not be used in CI: tags can be force-pushed, branches change over
 time. The threat model is "the trust root of your supply-chain scanner is
 itself supply-chain-controllable" — so always pin to a full SHA. Find the
-SHA matching a tag at the [releases page](https://github.com/TableCheck-Labs/codeartifact-shield/releases).
+SHA matching a tag at the [releases page](https://github.com/alexandernicholson/codeartifact-shield/releases).
 
 For development:
 
 ```bash
-git clone https://github.com/TableCheck-Labs/codeartifact-shield.git
+git clone https://github.com/alexandernicholson/codeartifact-shield.git
 cd codeartifact-shield
 pip install -e ".[dev]"
 ```
@@ -562,25 +588,70 @@ cas audit [OPTIONS] LOCKFILE
 | `--ca-domain DOMAIN`     | CodeArtifact domain. When set, packages 404'ing on `--probe-private` are probed against the CA endpoint (bearer token via boto3). A hit demotes the finding to INFO — saves enumerating private package names. Env: `CAS_DOMAIN`.                                          |
 | `--ca-repository REPO`   | CodeArtifact repository. Required with `--ca-domain`. Env: `CAS_REPOSITORY`.                                                                                                                                                                                                |
 | `--ca-domain-owner ACCT` | CodeArtifact domain-owner AWS account ID. Optional. Env: `CAS_DOMAIN_OWNER`.                                                                                                                                                                                                |
-| `--max-workers N`        | Thread-pool size for parallel HEAD probes and OSV vuln-detail fetches. Default 20. Env: `CAS_AUDIT_MAX_WORKERS`.                                                                                                                                                            |
+| `--max-workers N`        | Upper bound on concurrent HTTP requests across all phases (endpoint × chunk OSV batches, HEAD probes, vuln-detail fetches). Default 32. Env: `CAS_AUDIT_MAX_WORKERS`.                                                                                                       |
+| `--osv-endpoint URL`     | OSV-compatible base URL (repeatable). Dispatch the batch query to every endpoint in parallel and union the results per `(name, version)`. Cross-source findings are deduplicated by alias overlap (one logical vuln → one finding). Default: `https://api.osv.dev` only. Env: `CAS_OSV_ENDPOINTS` (whitespace-separated). |
 | `--probe-cache PATH`     | JSON cache of probe results across CI runs. Entries never invalidate. A fully-cached audit completes in <10s on a 2500-package lockfile. Env: `CAS_AUDIT_PROBE_CACHE`.                                                                                                      |
 | `--retries N`            | How many times to retry a transient HTTP error (URLError, TimeoutError, HTTP 5xx, HTTP 429). Default 2 (3 total attempts). 429 responses honour `Retry-After` (capped at 60s). 404 and other 4xx are never retried. Shared env: `CAS_RETRIES`.                              |
 | `--json`                 | Machine-readable JSON on stdout instead of human text.                                                                                                                                                                                                                      |
 | `-h`, `--help`           | Show help.                                                                                                                                                                                                                                                                  |
 
+### Multi-source OSV (v0.8.0+)
+
+`--osv-endpoint URL` is repeatable — every endpoint must speak the OSV
+HTTP contract (`POST /v1/querybatch` + `GET /v1/vulns/{id}`).
+
+```
+cas audit ./package-lock.json \
+  --osv-endpoint https://api.osv.dev \
+  --osv-endpoint https://cas-server.internal \
+  --min-severity high
+```
+
+What happens under the hood:
+
+* The batch query is dispatched in parallel across the cross product of
+  `(endpoint × chunk)` — `E` endpoints × `C` chunks → up to `E·C`
+  in-flight HTTP requests, capped by `--max-workers`. Adding endpoints
+  costs almost nothing in wall time.
+* Per `(name, version)`, vuln IDs returned by *any* endpoint are
+  unioned. The first endpoint listed wins as the preferred source for
+  the detail fetch; if it fails transiently, cas falls back to other
+  endpoints that returned the same id.
+* **Cross-source dedup:** if `https://cas-server.internal` publishes
+  `EX-2026-0001` with `aliases: ["GHSA-abcd-..."]` and `https://api.osv.dev`
+  returns plain `GHSA-abcd-...` for the same `(pkg, ver)`, cas emits
+  **one** finding. The canonical vuln_id is the lex-smallest in the
+  alias-overlap group; the other id appears in the merged `aliases`
+  list. Severity is the maximum across the group.
+* **Resilient fallthrough:** if one configured endpoint is down but at
+  least one answered, the build succeeds against the answering set.
+  Only when *every* endpoint fails does cas emit a `network_error`.
+
+The finding's `source` field records which endpoint surfaced it —
+shown inline in the human output and as `source` in the JSON. Empty
+when only one endpoint is configured (back-compat).
+
 ### Performance
 
-`cas audit` parallelises the `--probe-private` phase and OSV
-vuln-detail fetches via `ThreadPoolExecutor`. Probes use HTTP HEAD —
-no body transferred. With `--probe-cache`, package-existence results
-persist across runs. Measured on a 2500-package lockfile, public-npm
-probe + CA fallback:
+`cas audit` parallelises every network phase via `ThreadPoolExecutor`:
+
+* Endpoint × chunk batch dispatch (see above).
+* `--probe-private` and CA fallback HEAD probes.
+* Per-vuln detail fetches.
+
+Probes use HTTP HEAD — no body transferred. With `--probe-cache`,
+package-existence results persist across runs. Measured on a
+2500-package lockfile, public-npm probe + CA fallback:
 
 | Mode                                  | Wall time     |
 | ------------------------------------- | ------------- |
 | First run, parallel HEAD              | ~15–20 sec    |
 | First run, serial (`--max-workers 1`) | ~3–4 minutes  |
 | Cached run                            | <10 sec       |
+
+Multi-endpoint scaling: a 5-endpoint setup against the same lockfile
+adds < 1 sec wall time over the single-endpoint cold-run because
+`(endpoint × chunk)` calls fire concurrently.
 
 ### Secure by default — unaudited private packages
 
@@ -620,7 +691,7 @@ cas audit ./package-lock.json \
 cas accepts two shapes for `--whitelist`:
 
 **1. `auditjs` / Sonatype OSS Index format** (what `auditjs` emits and
-what TableCheck-style projects already maintain):
+what existing auditjs users already maintain):
 
 ```json
 {
@@ -918,6 +989,7 @@ the check is consistent everywhere.
 | `CAS_AUDIT_PROBE_REGISTRY`| `cas audit`          | Default for `--probe-private`.                              |
 | `CAS_AUDIT_MAX_WORKERS`   | `cas audit`          | Default for `--max-workers`.                                |
 | `CAS_AUDIT_PROBE_CACHE`   | `cas audit`          | Default path for `--probe-cache`.                           |
+| `CAS_OSV_ENDPOINTS`       | `cas audit`          | Whitespace-separated default for `--osv-endpoint`. Each item is a base URL speaking the OSV HTTP contract. |
 | `CAS_COOLDOWN_MIN_AGE`    | `cas cooldown`       | Default for `--min-age`.                                    |
 | `CAS_COOLDOWN_ALLOW`      | `cas cooldown`       | Whitespace-separated default for `--allow`.                 |
 | `CAS_ALLOW_PRIVATE`       | `cas audit`, `cas cooldown` | Whitespace-separated default for `--allow-private`. Shared across both commands. |
@@ -998,7 +1070,7 @@ on an unchanged lockfile complete in well under a second.
 set -e
 # Hard-coded — not configurable via env. The version check below is
 # operational sanity, not a security control.
-readonly _CAS_INSTALL_REF="git+https://github.com/TableCheck-Labs/codeartifact-shield.git@<full-sha>"
+readonly _CAS_INSTALL_REF="git+https://github.com/alexandernicholson/codeartifact-shield.git@<full-sha>"
 readonly _CAS_EXPECTED_VERSION="0.4.0"
 if ! command -v cas >/dev/null 2>&1; then
   pip install --quiet "$_CAS_INSTALL_REF"

@@ -168,3 +168,25 @@ def test_v1_lockfile_rejected(tmp_path: Path) -> None:
     p.write_text(json.dumps({"lockfileVersion": 1}))
     with pytest.raises(ValueError, match="unsupported lockfileVersion"):
         check_install_scripts(p)
+
+
+def test_scripts_versioned_allow_demotes_only_that_version(tmp_path: Path) -> None:
+    """`--allow node-gyp@10.0.0` permits install scripts only for 10.0.0.
+    Other node-gyp versions still flagged."""
+    lf = tmp_path / "package-lock.json"
+    lf.write_text(json.dumps({
+        "lockfileVersion": 3,
+        "packages": {
+            "node_modules/node-gyp": {
+                "version": "10.0.0", "hasInstallScript": True,
+            },
+            "node_modules/other/node_modules/node-gyp": {
+                "version": "9.0.0", "hasInstallScript": True,
+            },
+        },
+    }))
+    report = check_install_scripts(lf, allowed=["node-gyp@10.0.0"])
+    flagged = {(f.package_name, f.version) for f in report.flagged}
+    allowed = {(f.package_name, f.version) for f in report.allowed}
+    assert flagged == {("node-gyp", "9.0.0")}
+    assert allowed == {("node-gyp", "10.0.0")}

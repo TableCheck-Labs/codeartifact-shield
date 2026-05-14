@@ -23,15 +23,35 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from codeartifact_shield._allowlist import PackageAllowlist
 from codeartifact_shield._http import DEFAULT_RETRIES, with_retry
 from codeartifact_shield._lockfile import extract_package_name, load_lockfile
 from codeartifact_shield._registry import RegistryEndpoint, package_url
 
-OSV_BATCH_ENDPOINT = "https://api.osv.dev/v1/querybatch"
-OSV_VULN_ENDPOINT = "https://api.osv.dev/v1/vulns"
+OSV_DEFAULT_ENDPOINT = "https://api.osv.dev"
 OSV_TIMEOUT_SECONDS = 30
 OSV_BATCH_SIZE = 1000
-DEFAULT_PROBE_WORKERS = 20
+
+
+def _osv_batch_url(base: str) -> str:
+    return f"{base.rstrip('/')}/v1/querybatch"
+
+
+def _osv_vuln_url(base: str, vid: str) -> str:
+    return f"{base.rstrip('/')}/v1/vulns/{vid}"
+DEFAULT_PROBE_WORKERS = 32
+"""Default cap on concurrent OSV / probe / detail-fetch HTTP requests.
+
+The audit pipeline is pure network I/O — Python's GIL doesn't constrain
+throughput at this scale because every thread spends almost its entire
+lifetime blocked in ``urlopen``. The pool size is the upper bound on
+in-flight requests across (a) endpoint × chunk OSV batches, (b) probe
+HEADs against private registries, (c) per-vuln detail fetches.
+
+32 is a balance: large enough that a CI build talking to half a dozen
+OSV endpoints + a CodeArtifact probe doesn't serialise behind the
+default; small enough that an upstream registry won't see us as a
+synthetic-DoS source. Override with ``--max-workers``."""
 PROBE_CACHE_SCHEMA_VERSION = 1
 
 # Cache shape: {endpoint_label: {package_name: "found" | "404"}}
@@ -78,6 +98,11 @@ class AuditFinding:
     summary: str
     fixed_in: str | None
     aliases: list[str] = field(default_factory=list)
+    source: str = ""
+    """OSV endpoint that surfaced this finding. Empty string for the OSV.dev
+    default when only one endpoint is configured (back-compat). Populated
+    with the endpoint URL when ``--osv-endpoint`` is used and multiple
+    sources are in play."""
 
 
 @dataclass
@@ -85,15 +110,19 @@ class AuditReport:
     findings: list[AuditFinding] = field(default_factory=list)
     total_checked: int = 0
     network_error: str | None = None
-    unaudited_blocked: list[str] = field(default_factory=list)
-    """Package names not on the configured public registry AND not covered
-    by OSV. HIGH-severity under the secure-by-default policy: a name no
-    public source can verify is either a typo, lockfile tampering, or an
-    internal package the user must explicitly trust via ``allow_unaudited``.
+    unaudited_blocked: list[tuple[str, str]] = field(default_factory=list)
+    """``(name, version)`` pairs not on the configured public registry AND
+    not covered by OSV. HIGH-severity under the secure-by-default policy:
+    a pair no public source can verify is either a typo, lockfile
+    tampering, or an internal package the user must explicitly trust via
+    ``allow_unaudited``.
 
-    Populated only when ``probe_registry`` is supplied."""
+    Populated only when ``probe_registry`` is supplied. The shape is per-
+    ``(name, version)`` since v0.8.0 so versioned allowlist entries
+    (``--allow-private @my/pkg@1.0.0``) can be applied surgically; earlier
+    versions emitted name-only strings."""
 
-    unaudited_allowed: list[str] = field(default_factory=list)
+    unaudited_allowed: list[tuple[str, str]] = field(default_factory=list)
     """Same condition as ``unaudited_blocked`` but explicitly allowlisted.
     INFO-severity; doesn't fail the gate."""
 
@@ -284,8 +313,8 @@ def load_whitelist_file(path: Path) -> list[str]:
 
            {"ignore": [{"id": "CVE-2023-42282"}, ...]}
 
-       This is the file the ``auditjs`` CLI emits and what TableCheck-style
-       projects already maintain. The top-level ``affected`` array (if
+       This is the file the ``auditjs`` CLI emits. The top-level
+       ``affected`` array (if
        present) is ignored — only ``ignore[].id`` is read.
 
     2. Plain JSON array of strings::
@@ -317,14 +346,182 @@ def load_whitelist_file(path: Path) -> list[str]:
     )
 
 
+def _batch_query_all_endpoints(
+    endpoints: list[str],
+    queries: list[dict[str, Any]],
+    timeout: int,
+    retries: int,
+    max_workers: int,
+) -> tuple[dict[str, list[list[str]] | None], dict[str, str]]:
+    """Parallel-dispatch the batch query to every configured endpoint.
+
+    Concurrency is flattened across the ``(endpoint, chunk)`` cross product:
+    `E` endpoints × `C` chunks → up to `E·C` in-flight HTTP requests, capped
+    by ``max_workers``. The previous design only fanned out across endpoints
+    and serialised chunks within each one, which was the bottleneck on
+    deployments with many endpoints OR many packages (>1000 per chunk).
+
+    Returns ``(per_endpoint_results, per_endpoint_errors)``. A `None` entry
+    in the results dict means that endpoint failed after retries were
+    exhausted — the failure message is in the errors dict. Endpoint-level
+    failure is *any* of its chunks erroring; partial-chunk degraded mode is
+    not surfaced (the retry helper already handles transient flakes within
+    a single chunk).
+    """
+    chunk_offsets = list(range(0, len(queries), OSV_BATCH_SIZE))
+    chunk_count = len(chunk_offsets) if chunk_offsets else 1
+    if not chunk_offsets:
+        chunk_offsets = [0]
+    jobs: list[tuple[str, int, list[dict[str, Any]]]] = []
+    for base in endpoints:
+        for chunk_idx, start in enumerate(chunk_offsets):
+            chunk = queries[start : start + OSV_BATCH_SIZE]
+            jobs.append((base, chunk_idx, chunk))
+
+    chunk_results: dict[str, list[dict[str, Any] | None]] = {
+        base: [None] * chunk_count for base in endpoints
+    }
+    errors: dict[str, str] = {}
+    workers = max(1, min(max_workers, len(jobs)))
+
+    def fetch_chunk(
+        base: str, chunk_idx: int, chunk: list[dict[str, Any]]
+    ) -> tuple[str, int, dict[str, Any]]:
+        url = _osv_batch_url(base)
+        payload = _http_post_json(
+            url, {"queries": chunk}, timeout=timeout, retries=retries
+        )
+        return base, chunk_idx, payload
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(fetch_chunk, base, idx, chunk): (base, idx)
+            for base, idx, chunk in jobs
+        }
+        for future in as_completed(futures):
+            base, idx = futures[future]
+            try:
+                _, _, payload = future.result()
+                chunk_results[base][idx] = payload
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+                json.JSONDecodeError,
+            ) as exc:
+                errors.setdefault(base, f"{type(exc).__name__}: {exc}")
+
+    results: dict[str, list[list[str]] | None] = {}
+    for base in endpoints:
+        if base in errors or any(c is None for c in chunk_results[base]):
+            results[base] = None
+            errors.setdefault(base, "partial chunk failure")
+            continue
+        flattened: list[list[str]] = []
+        for maybe_payload in chunk_results[base]:
+            if maybe_payload is None:
+                continue
+            for entry in maybe_payload.get("results", []):
+                ids = [v["id"] for v in entry.get("vulns", []) if "id" in v]
+                flattened.append(ids)
+        results[base] = flattened
+    return results, errors
+
+
+def _fetch_vuln_detail_resilient(
+    vid: str,
+    endpoints: list[str],
+    per_endpoint_results: dict[str, list[list[str]] | None],
+    id_origin: dict[str, str],
+    timeout: int,
+    retries: int,
+) -> tuple[str, dict[str, Any], str]:
+    """Fetch one vuln's detail. Prefer the endpoint that returned the id;
+    on transient failure, try other endpoints that also returned it.
+
+    Raises the last exception if every candidate fails.
+    """
+    primary = id_origin.get(vid)
+    candidates: list[str] = []
+    if primary is not None:
+        candidates.append(primary)
+    for base in endpoints:
+        if base == primary:
+            continue
+        per_q = per_endpoint_results.get(base)
+        if per_q is None:
+            continue
+        if any(vid in q for q in per_q):
+            candidates.append(base)
+    last_exc: BaseException | None = None
+    for base in candidates:
+        try:
+            d = _http_get_json(
+                _osv_vuln_url(base, vid), timeout=timeout, retries=retries
+            )
+            return vid, d, base
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            json.JSONDecodeError,
+        ) as exc:
+            last_exc = exc
+            continue
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"no endpoint returned vuln id {vid}")
+
+
+def _canonicalize_vulns(details: dict[str, dict[str, Any]]) -> dict[str, str]:
+    """Group vulns by alias overlap; return ``{vid: canonical_vid}`` where
+    the canonical is the lex-smallest member of each group.
+
+    Two vulns are in the same group iff their `{id} ∪ aliases` sets (case-
+    insensitive) overlap. Implements union-find for transitive closure.
+    """
+    parent: dict[str, str] = {vid: vid for vid in details}
+
+    def find(x: str) -> str:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        # Path compression.
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        if ra < rb:
+            parent[rb] = ra
+        else:
+            parent[ra] = rb
+
+    key_to_first: dict[str, str] = {}
+    for vid in sorted(details):
+        d = details[vid]
+        keys = {vid.upper()} | {
+            a.upper() for a in (d.get("aliases", []) or []) if isinstance(a, str)
+        }
+        for k in keys:
+            if k in key_to_first:
+                union(key_to_first[k], vid)
+            else:
+                key_to_first[k] = vid
+
+    return {vid: find(vid) for vid in details}
+
+
 def audit_lockfile(
     lockfile_path: Path,
     allow_ids: Iterable[str] = (),
     allow_unaudited: Iterable[str] = (),
     severity_floor: str | None = None,
     whitelist_file: Path | None = None,
-    batch_endpoint: str = OSV_BATCH_ENDPOINT,
-    vuln_endpoint: str = OSV_VULN_ENDPOINT,
+    osv_endpoints: Iterable[str] = (OSV_DEFAULT_ENDPOINT,),
     probe_registry: str | None = None,
     trusted_endpoints: Iterable[RegistryEndpoint] | None = None,
     probe_cache_path: Path | None = None,
@@ -332,7 +529,7 @@ def audit_lockfile(
     retries: int = DEFAULT_RETRIES,
     timeout: int = OSV_TIMEOUT_SECONDS,
 ) -> AuditReport:
-    """Audit every (name, version) pair in the lockfile against OSV.dev.
+    """Audit every (name, version) pair in the lockfile against OSV-compatible endpoints.
 
     Args:
         lockfile_path: ``package-lock.json`` to audit.
@@ -341,9 +538,17 @@ def audit_lockfile(
         severity_floor: Drop findings below this severity. One of
             ``CRITICAL`` / ``HIGH`` / ``MEDIUM`` / ``LOW`` (case-insensitive).
             ``None`` means report all.
-        batch_endpoint: Override the OSV.dev batch URL (for tests or
-            air-gapped mirrors).
-        vuln_endpoint: Override the OSV.dev single-vuln URL.
+        osv_endpoints: Ordered list of OSV-compatible base URLs. Each must
+            speak ``POST /v1/querybatch`` and ``GET /v1/vulns/{id}``. cas
+            dispatches the batch query to every endpoint in parallel and
+            unions the returned vuln IDs per ``(name, version)``. The first
+            endpoint in this list that returned a given ID is the preferred
+            source for the detail fetch; others are tried as fallback on
+            transient failure. Default: a single entry pointing at
+            ``https://api.osv.dev``. Endpoints surfacing the same vuln under
+            different IDs (e.g. ``EX-2026-0001`` with ``aliases: [GHSA-…]``
+            on a private server vs. plain ``GHSA-…`` on OSV.dev) are
+            deduplicated at finding emit time via alias-overlap union-find.
         timeout: HTTP timeout in seconds, applied per request.
     """
     lock = load_lockfile(lockfile_path)
@@ -371,32 +576,53 @@ def audit_lockfile(
         for (name, version) in pkg_list
     ]
 
-    all_results: list[list[str]] = []
-    try:
-        for chunk_start in range(0, len(queries), OSV_BATCH_SIZE):
-            chunk = queries[chunk_start : chunk_start + OSV_BATCH_SIZE]
-            payload = _http_post_json(
-                batch_endpoint, {"queries": chunk}, timeout=timeout, retries=retries
-            )
-            for entry in payload.get("results", []):
-                ids = [v["id"] for v in entry.get("vulns", []) if "id" in v]
-                all_results.append(ids)
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        report.network_error = f"OSV.dev batch query failed: {exc}"
+    endpoints_list = list(osv_endpoints) or [OSV_DEFAULT_ENDPOINT]
+    endpoint_query_results, endpoint_errors = _batch_query_all_endpoints(
+        endpoints_list, queries, timeout=timeout, retries=retries, max_workers=max_workers
+    )
+    if all(v is None for v in endpoint_query_results.values()):
+        joined = "; ".join(
+            f"{b}: {endpoint_errors.get(b, 'unknown')}" for b in endpoints_list
+        )
+        report.network_error = f"OSV batch query failed on all endpoints — {joined}"
         return report
+
+    # Merge ids per query across endpoints; preserve user-listed order for
+    # detail-fetch precedence (first endpoint that returned an id wins).
+    all_results: list[list[str]] = [[] for _ in pkg_list]
+    merged_sets: list[set[str]] = [set() for _ in pkg_list]
+    id_origin: dict[str, str] = {}
+    for base in endpoints_list:
+        per_query = endpoint_query_results.get(base)
+        if per_query is None:
+            continue
+        for i, ids in enumerate(per_query):
+            if i >= len(all_results):
+                break
+            for vid in ids:
+                if vid not in merged_sets[i]:
+                    merged_sets[i].add(vid)
+                    all_results[i].append(vid)
+                id_origin.setdefault(vid, base)
 
     unique_ids: set[str] = set()
     for ids in all_results:
         unique_ids.update(ids)
 
     details: dict[str, dict[str, Any]] = {}
+    detail_source: dict[str, str] = {}
     if unique_ids:
         sorted_ids = sorted(unique_ids)
         detail_workers = max(1, min(max_workers, len(sorted_ids)))
 
-        def fetch_detail(vid: str) -> tuple[str, dict[str, Any]]:
-            return vid, _http_get_json(
-                f"{vuln_endpoint}/{vid}", timeout=timeout, retries=retries
+        def fetch_detail(vid: str) -> tuple[str, dict[str, Any], str]:
+            return _fetch_vuln_detail_resilient(
+                vid,
+                endpoints_list,
+                endpoint_query_results,
+                id_origin,
+                timeout=timeout,
+                retries=retries,
             )
 
         try:
@@ -404,15 +630,16 @@ def audit_lockfile(
                 for future in as_completed(
                     [pool.submit(fetch_detail, vid) for vid in sorted_ids]
                 ):
-                    vid, detail = future.result()
+                    vid, detail, src = future.result()
                     details[vid] = detail
+                    detail_source[vid] = src
         except (
             urllib.error.URLError,
             TimeoutError,
             OSError,
             json.JSONDecodeError,
         ) as exc:
-            report.network_error = f"OSV.dev vuln detail fetch failed: {exc}"
+            report.network_error = f"OSV vuln detail fetch failed: {exc}"
             return report
 
     combined_allow: list[str] = list(allow_ids)
@@ -433,10 +660,12 @@ def audit_lockfile(
                 label="probe-registry",
             )
 
-        unaudited_allowlist = {n.lower() for n in allow_unaudited}
-        candidates = sorted(
-            {name for (name, _) in pkg_list if not name_had_findings.get(name)}
+        unaudited_allowlist = PackageAllowlist.from_entries(allow_unaudited)
+        candidate_pairs: list[tuple[str, str]] = sorted(
+            {(name, version) for (name, version) in pkg_list
+             if not name_had_findings.get(name)}
         )
+        candidates = sorted({name for (name, _) in candidate_pairs})
 
         probe_cache: ProbeCache = (
             load_probe_cache(probe_cache_path) if probe_cache_path else {}
@@ -505,21 +734,21 @@ def audit_lockfile(
                 else:  # "error"
                     seen_error.setdefault(name, endpoint.label)
 
-        for name in candidates:
+        for (name, version) in candidate_pairs:
             via = confirmed_via.get(name)
             if via == "probe-registry":
                 # Public + no OSV findings → silently clean.
                 continue
             if via is not None:
                 # Resolved on a trusted endpoint → INFO.
-                report.unaudited_allowed.append(name)
+                report.unaudited_allowed.append((name, version))
                 continue
-            if name.lower() in unaudited_allowlist:
-                report.unaudited_allowed.append(name)
+            if unaudited_allowlist.allows(name, version):
+                report.unaudited_allowed.append((name, version))
                 continue
             if seen_any_404.get(name) and name not in seen_error:
                 # 404'd cleanly on every endpoint we asked → known-blocked.
-                report.unaudited_blocked.append(name)
+                report.unaudited_blocked.append((name, version))
                 continue
             if name in seen_error:
                 # No endpoint resolved it AND at least one errored — we
@@ -532,7 +761,7 @@ def audit_lockfile(
                 return report
             # Defensive fallback: no resolution, no 404, no error. Should
             # be unreachable but treat as blocked rather than silently OK.
-            report.unaudited_blocked.append(name)
+            report.unaudited_blocked.append((name, version))
 
         if probe_cache_path is not None:
             try:
@@ -542,29 +771,58 @@ def audit_lockfile(
                     f"failed to save probe cache to {probe_cache_path}: {exc}"
                 )
 
+    canonical_map = _canonicalize_vulns(details)
+    # canonical_id → list of vids in its alias-overlap group.
+    groups: dict[str, list[str]] = {}
+    for vid, canonical in canonical_map.items():
+        groups.setdefault(canonical, []).append(vid)
+
+    seen_canonical_per_pkg: dict[tuple[str, str], set[str]] = {}
     for i, ids in enumerate(all_results):
         if not ids:
             continue
         name, version = pkg_list[i]
-        for vid in ids:
-            d = details.get(vid, {})
-            aliases = d.get("aliases", []) or []
-            if vid.upper() in allowlist:
+        seen_for_pkg = seen_canonical_per_pkg.setdefault((name, version), set())
+        # Iterate deterministically to make finding ordering reproducible.
+        for vid in sorted(ids):
+            canonical = canonical_map.get(vid, vid)
+            if canonical in seen_for_pkg:
                 continue
-            if any(alias.upper() in allowlist for alias in aliases):
+            group_members = sorted(groups.get(canonical, [vid]))
+            merged_aliases: set[str] = set()
+            for member in group_members:
+                d_member = details.get(member, {})
+                for alias in d_member.get("aliases", []) or []:
+                    if isinstance(alias, str):
+                        merged_aliases.add(alias)
+                if member != canonical:
+                    merged_aliases.add(member)
+            all_keys = {canonical.upper()} | {a.upper() for a in merged_aliases}
+            if all_keys & allowlist:
                 continue
-            severity = _extract_severity(d)
+            # Pick the highest severity across the group — a conservative
+            # merge: if one endpoint says HIGH and another says CRITICAL,
+            # report CRITICAL.
+            severity = "UNKNOWN"
+            for member in group_members:
+                sev = _extract_severity(details.get(member, {}))
+                if SEVERITY_RANK.get(sev, 0) > SEVERITY_RANK.get(severity, 0):
+                    severity = sev
             if severity_floor and not _meets_floor(severity, severity_floor):
                 continue
+            d_canonical = details.get(canonical, details.get(vid, {}))
+            source = detail_source.get(canonical, detail_source.get(vid, ""))
+            seen_for_pkg.add(canonical)
             report.findings.append(
                 AuditFinding(
                     package_name=name,
                     version=version,
-                    vuln_id=vid,
+                    vuln_id=canonical,
                     severity=severity,
-                    summary=d.get("summary", ""),
-                    fixed_in=_extract_fixed_version(d, name),
-                    aliases=list(aliases),
+                    summary=d_canonical.get("summary", ""),
+                    fixed_in=_extract_fixed_version(d_canonical, name),
+                    aliases=sorted(merged_aliases),
+                    source=source,
                 )
             )
 

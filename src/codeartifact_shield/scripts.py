@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from codeartifact_shield._allowlist import PackageAllowlist
 from codeartifact_shield._lockfile import extract_package_name, load_lockfile
 
 
@@ -91,7 +92,7 @@ def check_install_scripts(
     script-running entry is in the allowlist.
     """
     lock = load_lockfile(lockfile_path)
-    allowlist = {name.lower() for name in allowed}
+    allowlist = PackageAllowlist.from_entries(allowed)
     pkgs: dict[str, dict[str, Any]] = lock.get("packages", {})
 
     report = ScriptsReport()
@@ -107,7 +108,7 @@ def check_install_scripts(
             package_name=extract_package_name(key, entry),
             version=entry.get("version", ""),
         )
-        if finding.package_name.lower() in allowlist:
+        if allowlist.allows(finding.package_name, finding.version):
             report.allowed.append(finding)
         else:
             report.flagged.append(finding)

@@ -385,10 +385,9 @@ def test_cooldown_uses_name_field_for_npm_aliases(tmp_path: Path) -> None:
 def test_cooldown_falls_through_when_version_missing_from_time_dict(
     tmp_path: Path,
 ) -> None:
-    # The real-world bug observed against diner-frontend-next: public npm
-    # returns metadata for `@tablecheck/...` packages but without the
-    # specific version in `time`. cas must treat that as "endpoint doesn't
-    # have this version" and fall through, not as a hard error.
+    # Real-world: public npm returns metadata for scoped names but without
+    # the specific version in `time`. cas must treat that as "endpoint
+    # doesn't have this version" and fall through, not as a hard error.
     lf = _write_lock(
         tmp_path, {"node_modules/@my/internal": {"version": "2.0.0"}}
     )
@@ -778,3 +777,79 @@ def test_cooldown_error_does_not_leak_into_private_blocked(
     assert "lodash@4.17.21" not in report.private_blocked
     assert report.private_blocked == []
     assert len(report.network_errors) == 1
+
+
+# ---------------------------------------------------------------------------
+# Versioned allowlist — v0.8.0
+# ---------------------------------------------------------------------------
+
+
+def test_cooldown_versioned_allow_demotes_only_that_version(tmp_path: Path) -> None:
+    """`--allow lodash@4.17.21` demotes only that version. Other lodash
+    versions still get flagged if young."""
+    lf = _write_lock(
+        tmp_path,
+        {
+            "node_modules/lodash": {"version": "4.17.21"},
+            "node_modules/old-lodash/node_modules/lodash": {"version": "3.10.0"},
+        },
+    )
+    now = _now(2024, 1, 15)
+    yesterday_iso = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        return {"time": {"4.17.21": yesterday_iso, "3.10.0": yesterday_iso}}
+
+    with patch("codeartifact_shield.cooldown._http_get_json", mock):
+        report = check_cooldown(lf, now=now, allowed=["lodash@4.17.21"])
+    flagged = {(f.package_name, f.version) for f in report.flagged}
+    allowed = {(f.package_name, f.version) for f in report.allowed}
+    assert ("lodash", "3.10.0") in flagged
+    assert ("lodash", "4.17.21") in allowed
+
+
+def test_cooldown_versioned_allow_private(tmp_path: Path) -> None:
+    """`--allow-private @my/pkg@1.0.0` demotes only that version of an
+    unresolvable private package."""
+    lf = _write_lock(
+        tmp_path,
+        {
+            "node_modules/@my/pkg": {"version": "1.0.0"},
+            "node_modules/@my/pkg-other/node_modules/@my/pkg": {"version": "2.0.0"},
+        },
+    )
+
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
+
+    with patch("codeartifact_shield.cooldown._http_get_json", mock):
+        report = check_cooldown(lf, now=_now(), allow_private=["@my/pkg@1.0.0"])
+    assert "@my/pkg@1.0.0" in report.private_allowed
+    assert "@my/pkg@2.0.0" in report.private_blocked
+
+
+def test_cooldown_name_only_allow_still_works(tmp_path: Path) -> None:
+    """Back-compat: `--allow lodash` continues to demote every version."""
+    lf = _write_lock(
+        tmp_path,
+        {
+            "node_modules/lodash": {"version": "4.17.21"},
+            "node_modules/old-lodash/node_modules/lodash": {"version": "3.10.0"},
+        },
+    )
+    now = _now(2024, 1, 15)
+    yesterday_iso = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    def mock(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        return {"time": {"4.17.21": yesterday_iso, "3.10.0": yesterday_iso}}
+
+    with patch("codeartifact_shield.cooldown._http_get_json", mock):
+        report = check_cooldown(lf, now=now, allowed=["lodash"])
+    assert report.flagged == []
+    assert len(report.allowed) == 2

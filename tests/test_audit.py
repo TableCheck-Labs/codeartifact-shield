@@ -517,9 +517,9 @@ def test_audit_probe_private_flags_packages_missing_from_public_npm(
             lf, probe_registry="https://registry.npmjs.org"
         )
     # Secure-by-default: package not in OSV AND not on public npm → HIGH.
-    assert "@my/internal-only" in report.unaudited_blocked
-    assert "@my/internal-only" not in report.unaudited_allowed
-    assert "lodash" not in report.unaudited_blocked
+    assert any(n == "@my/internal-only" for n, _ in report.unaudited_blocked)
+    assert all(n != "@my/internal-only" for n, _ in report.unaudited_allowed)
+    assert all(n != "lodash" for n, _ in report.unaudited_blocked)
     assert not report.clean
 
 
@@ -615,8 +615,8 @@ def test_audit_ca_endpoint_demotes_unaudited_to_info(tmp_path: Path) -> None:
             probe_registry="https://registry.npmjs.org",
             trusted_endpoints=trusted,
         )
-    assert "@my/internal" in report.unaudited_allowed
-    assert "@my/internal" not in report.unaudited_blocked
+    assert any(n == "@my/internal" for n, _ in report.unaudited_allowed)
+    assert all(n != "@my/internal" for n, _ in report.unaudited_blocked)
     assert report.clean  # build does not fail
 
 
@@ -654,8 +654,8 @@ def test_audit_404_on_all_endpoints_stays_blocked(tmp_path: Path) -> None:
             probe_registry="https://registry.npmjs.org",
             trusted_endpoints=trusted,
         )
-    assert "lodahs" in report.unaudited_blocked
-    assert "lodahs" not in report.unaudited_allowed
+    assert any(n == "lodahs" for n, _ in report.unaudited_blocked)
+    assert all(n != "lodahs" for n, _ in report.unaudited_allowed)
     assert not report.clean
 
 
@@ -698,8 +698,8 @@ def test_audit_only_ca_no_public_probe(tmp_path: Path) -> None:
             # No probe_registry — CA endpoint is the only trust source.
             trusted_endpoints=trusted,
         )
-    assert "@my/legit" in report.unaudited_allowed
-    assert "@my/typo" in report.unaudited_blocked
+    assert any(n == "@my/legit" for n, _ in report.unaudited_allowed)
+    assert any(n == "@my/typo" for n, _ in report.unaudited_blocked)
     assert not report.clean
 
 
@@ -726,7 +726,7 @@ def test_audit_backward_compat_no_ca_endpoints(tmp_path: Path) -> None:
         report = audit_lockfile(
             lf, probe_registry="https://registry.npmjs.org"
         )
-    assert "@my/internal-only" in report.unaudited_blocked
+    assert any(n == "@my/internal-only" for n, _ in report.unaudited_blocked)
     assert not report.clean
 
 
@@ -757,8 +757,8 @@ def test_audit_allow_private_demotes_unaudited_to_info(tmp_path: Path) -> None:
             probe_registry="https://registry.npmjs.org",
             allow_unaudited=["@org/legit-internal"],
         )
-    assert "@org/legit-internal" in report.unaudited_allowed
-    assert "@org/typo" in report.unaudited_blocked
+    assert any(n == "@org/legit-internal" for n, _ in report.unaudited_allowed)
+    assert any(n == "@org/typo" for n, _ in report.unaudited_blocked)
     assert not report.clean
 
 
@@ -881,7 +881,7 @@ def test_audit_probe_cache_hit_avoids_http(tmp_path: Path) -> None:
             probe_cache_path=cache_file,
         )
     # lodash found → no finding; @my/internal 404 → blocked.
-    assert "@my/internal" in report.unaudited_blocked
+    assert any(n == "@my/internal" for n, _ in report.unaudited_blocked)
 
 
 def test_audit_probe_cache_miss_persists(tmp_path: Path) -> None:
@@ -965,9 +965,8 @@ def test_audit_real_auditjs_fixture_loads(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # Resilient fallthrough — a probe-registry error must not short-circuit
-# the trusted-endpoint fallback. Regression guard for the v0.7.1 CI failure:
-#   [HIGH] FAIL — Private-package probe failed for @tablecheck/tablekit-tel-input
-#          (probe-registry)
+# the trusted-endpoint fallback. Regression guard for the v0.7.1 CI failure
+# where a single probe-registry URLError aborted the whole audit.
 # ---------------------------------------------------------------------------
 
 
@@ -979,7 +978,7 @@ def test_audit_probe_error_but_ca_resolves_is_clean(tmp_path: Path) -> None:
 
     lf = _write_lock(
         tmp_path,
-        {"node_modules/@tablecheck/tablekit-tel-input": {"version": "1.0.0"}},
+        {"node_modules/@example/private-pkg": {"version": "1.0.0"}},
     )
 
     def mock_batch(
@@ -1011,7 +1010,7 @@ def test_audit_probe_error_but_ca_resolves_is_clean(tmp_path: Path) -> None:
             probe_registry="https://registry.npmjs.org",
             trusted_endpoints=trusted,
         )
-    assert "@tablecheck/tablekit-tel-input" in report.unaudited_allowed
+    assert any(n == "@example/private-pkg" for n, _ in report.unaudited_allowed)
     assert report.network_error is None
     assert report.unaudited_blocked == []
     assert report.clean
@@ -1213,3 +1212,395 @@ def test_audit_probe_error_one_pkg_other_pkg_resolves_correctly(
     assert report.network_error is not None
     assert "@my/sketchy" in report.network_error
     assert not report.clean
+
+
+# ---------------------------------------------------------------------------
+# Multi-endpoint OSV — v0.8.0
+# ---------------------------------------------------------------------------
+
+
+def test_audit_default_endpoint_is_osv_dev(tmp_path: Path) -> None:
+    """Backward compat — default `osv_endpoints` points at OSV.dev only,
+    and the URL passed to `_http_post_json` reflects that."""
+    lf = _write_lock(tmp_path, {"node_modules/react": {"version": "18.3.1"}})
+    captured_urls: list[str] = []
+
+    def mock_post(
+        url: str, body: dict[str, Any], timeout: int, retries: int = 2
+    ) -> dict[str, Any]:
+        captured_urls.append(url)
+        return {"results": [{}]}
+
+    def mock_get(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        raise AssertionError("no vuln details expected")
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_post), patch(
+        "codeartifact_shield.audit._http_get_json", mock_get
+    ):
+        report = audit_lockfile(lf)
+    assert report.clean
+    assert captured_urls == ["https://api.osv.dev/v1/querybatch"]
+
+
+def test_audit_dispatches_batch_to_every_configured_endpoint(tmp_path: Path) -> None:
+    """With two endpoints configured, the batch URL on each must be POSTed."""
+    lf = _write_lock(tmp_path, {"node_modules/react": {"version": "18.3.1"}})
+    captured_urls: list[str] = []
+
+    def mock_post(
+        url: str, body: dict[str, Any], timeout: int, retries: int = 2
+    ) -> dict[str, Any]:
+        captured_urls.append(url)
+        return {"results": [{}]}
+
+    def mock_get(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        raise AssertionError("no vuln details expected")
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_post), patch(
+        "codeartifact_shield.audit._http_get_json", mock_get
+    ):
+        audit_lockfile(
+            lf,
+            osv_endpoints=(
+                "https://api.osv.dev",
+                "https://cas-server.example.internal",
+            ),
+        )
+    assert sorted(captured_urls) == sorted(
+        [
+            "https://api.osv.dev/v1/querybatch",
+            "https://cas-server.example.internal/v1/querybatch",
+        ]
+    )
+
+
+def test_audit_unions_findings_from_two_endpoints(tmp_path: Path) -> None:
+    """One endpoint sees GHSA-X for axios, the other sees EX-Y. Both surface,
+    deduped only if they share aliases (this test: they don't)."""
+    lf = _write_lock(tmp_path, {"node_modules/axios": {"version": "1.6.7"}})
+
+    def mock_post(
+        url: str, body: dict[str, Any], timeout: int, retries: int = 2
+    ) -> dict[str, Any]:
+        if "osv.dev" in url:
+            return {"results": [{"vulns": [{"id": "GHSA-public-x"}]}]}
+        if "internal" in url:
+            return {"results": [{"vulns": [{"id": "EX-2026-0009"}]}]}
+        raise AssertionError(f"unexpected URL: {url}")
+
+    def mock_get(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        vid = url.rsplit("/", 1)[-1]
+        if vid == "GHSA-public-x":
+            return {
+                "id": "GHSA-public-x",
+                "summary": "public ssrf",
+                "database_specific": {"severity": "HIGH"},
+            }
+        if vid == "EX-2026-0009":
+            return {
+                "id": "EX-2026-0009",
+                "summary": "internal SOC finding",
+                "database_specific": {"severity": "CRITICAL"},
+            }
+        raise AssertionError(f"unexpected vuln URL: {url}")
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_post), patch(
+        "codeartifact_shield.audit._http_get_json", mock_get
+    ):
+        report = audit_lockfile(
+            lf,
+            osv_endpoints=(
+                "https://api.osv.dev",
+                "https://cas-server.internal",
+            ),
+        )
+    assert len(report.findings) == 2
+    vids = sorted(f.vuln_id for f in report.findings)
+    assert vids == ["EX-2026-0009", "GHSA-public-x"]
+
+
+def test_audit_dedupes_cross_endpoint_same_vuln_via_aliases(tmp_path: Path) -> None:
+    """The mini-Shai-Hulud-style case: cas-server publishes the TC-namespaced
+    advisory listing GHSA-X as an alias; OSV.dev later returns GHSA-X
+    directly. Both reach cas, but cas must emit ONE finding with merged
+    aliases."""
+    lf = _write_lock(tmp_path, {"node_modules/axios": {"version": "1.6.7"}})
+
+    def mock_post(
+        url: str, body: dict[str, Any], timeout: int, retries: int = 2
+    ) -> dict[str, Any]:
+        if "osv.dev" in url:
+            return {"results": [{"vulns": [{"id": "GHSA-aaaa-bbbb-cccc"}]}]}
+        if "internal" in url:
+            return {"results": [{"vulns": [{"id": "EX-2026-0099"}]}]}
+        raise AssertionError(url)
+
+    def mock_get(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        vid = url.rsplit("/", 1)[-1]
+        if vid == "GHSA-aaaa-bbbb-cccc":
+            return {
+                "id": "GHSA-aaaa-bbbb-cccc",
+                "summary": "axios SSRF (public GHSA wording)",
+                "database_specific": {"severity": "HIGH"},
+            }
+        if vid == "EX-2026-0099":
+            return {
+                "id": "EX-2026-0099",
+                "aliases": ["GHSA-aaaa-bbbb-cccc"],
+                "summary": "axios SSRF (internal SOC wording)",
+                "database_specific": {"severity": "CRITICAL"},
+            }
+        raise AssertionError(url)
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_post), patch(
+        "codeartifact_shield.audit._http_get_json", mock_get
+    ):
+        report = audit_lockfile(
+            lf,
+            osv_endpoints=(
+                "https://api.osv.dev",
+                "https://cas-server.internal",
+            ),
+        )
+    assert len(report.findings) == 1, "alias-overlap must collapse to one finding"
+    f = report.findings[0]
+    # Canonical id is the lex-smallest member of the group.
+    assert f.vuln_id == "EX-2026-0099"
+    # Merged aliases include the partner id.
+    assert "GHSA-aaaa-bbbb-cccc" in f.aliases
+    # Severity merge takes the maximum across the group.
+    assert f.severity == "CRITICAL"
+
+
+def test_audit_one_endpoint_down_others_keep_serving(tmp_path: Path) -> None:
+    """If one configured endpoint errors but at least one answered, the
+    build must NOT fail — matches v0.7.2 resilient-fallthrough semantics."""
+    lf = _write_lock(tmp_path, {"node_modules/axios": {"version": "1.6.7"}})
+
+    def mock_post(
+        url: str, body: dict[str, Any], timeout: int, retries: int = 2
+    ) -> dict[str, Any]:
+        if "broken" in url:
+            raise urllib.error.URLError("network unreachable")
+        return {"results": [{"vulns": [{"id": "EX-2026-0001"}]}]}
+
+    def mock_get(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        return {
+            "id": "EX-2026-0001",
+            "summary": "internal SOC finding",
+            "database_specific": {"severity": "HIGH"},
+        }
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_post), patch(
+        "codeartifact_shield.audit._http_get_json", mock_get
+    ):
+        report = audit_lockfile(
+            lf,
+            osv_endpoints=(
+                "https://broken.example",
+                "https://working.example",
+            ),
+        )
+    assert report.network_error is None
+    assert len(report.findings) == 1
+
+
+def test_audit_all_endpoints_down_surfaces_network_error(tmp_path: Path) -> None:
+    """All endpoints failing → hard network_error like the v0.7.x model."""
+    lf = _write_lock(tmp_path, {"node_modules/axios": {"version": "1.6.7"}})
+
+    def mock_post(
+        url: str, body: dict[str, Any], timeout: int, retries: int = 2
+    ) -> dict[str, Any]:
+        raise urllib.error.URLError("everything down")
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_post):
+        report = audit_lockfile(
+            lf,
+            osv_endpoints=(
+                "https://broken-1.example",
+                "https://broken-2.example",
+            ),
+        )
+    assert report.network_error is not None
+    assert "all endpoints" in report.network_error.lower()
+
+
+def test_audit_finding_source_attribution(tmp_path: Path) -> None:
+    """Each finding records which endpoint surfaced it (the canonical's
+    origin). When two endpoints both return the canonical, the
+    earlier-listed endpoint wins."""
+    lf = _write_lock(tmp_path, {"node_modules/axios": {"version": "1.6.7"}})
+
+    def mock_post(
+        url: str, body: dict[str, Any], timeout: int, retries: int = 2
+    ) -> dict[str, Any]:
+        if "primary" in url:
+            return {"results": [{"vulns": [{"id": "EX-2026-0001"}]}]}
+        if "secondary" in url:
+            return {"results": [{"vulns": [{"id": "EX-2026-0001"}]}]}
+        raise AssertionError(url)
+
+    def mock_get(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        return {"id": "EX-2026-0001", "database_specific": {"severity": "HIGH"}}
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_post), patch(
+        "codeartifact_shield.audit._http_get_json", mock_get
+    ):
+        report = audit_lockfile(
+            lf,
+            osv_endpoints=(
+                "https://primary.example",
+                "https://secondary.example",
+            ),
+        )
+    assert len(report.findings) == 1
+    assert report.findings[0].source == "https://primary.example"
+
+
+def test_audit_detail_fetch_falls_back_when_primary_endpoint_fails_after_batch(
+    tmp_path: Path,
+) -> None:
+    """An endpoint can succeed at the batch step but fail at the detail
+    step (transient). cas must try other endpoints that returned the same
+    id before giving up."""
+    lf = _write_lock(tmp_path, {"node_modules/axios": {"version": "1.6.7"}})
+    detail_attempts: list[str] = []
+
+    def mock_post(
+        url: str, body: dict[str, Any], timeout: int, retries: int = 2
+    ) -> dict[str, Any]:
+        return {"results": [{"vulns": [{"id": "EX-2026-0001"}]}]}
+
+    def mock_get(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        detail_attempts.append(url)
+        if "flaky" in url:
+            raise urllib.error.URLError("detail flake")
+        return {"id": "EX-2026-0001", "database_specific": {"severity": "HIGH"}}
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_post), patch(
+        "codeartifact_shield.audit._http_get_json", mock_get
+    ):
+        report = audit_lockfile(
+            lf,
+            osv_endpoints=(
+                "https://flaky.example",
+                "https://stable.example",
+            ),
+        )
+    assert report.network_error is None
+    assert len(report.findings) == 1
+    # Detail-fetch tried both endpoints, in order.
+    assert any("flaky" in u for u in detail_attempts)
+    assert any("stable" in u for u in detail_attempts)
+
+
+def test_audit_canonical_id_is_lex_smallest_in_alias_group(tmp_path: Path) -> None:
+    """If a group has GHSA-x, EX-y, and CVE-z all linked by aliases, the
+    canonical id is the lex-smallest — CVE-z. Forms a deterministic
+    contract for downstream allowlist matching."""
+    lf = _write_lock(tmp_path, {"node_modules/axios": {"version": "1.6.7"}})
+
+    def mock_post(
+        url: str, body: dict[str, Any], timeout: int, retries: int = 2
+    ) -> dict[str, Any]:
+        if "a.example" in url:
+            return {"results": [{"vulns": [{"id": "GHSA-xxxx"}]}]}
+        if "b.example" in url:
+            return {"results": [{"vulns": [{"id": "EX-2026-9999"}]}]}
+        raise AssertionError(url)
+
+    def mock_get(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        vid = url.rsplit("/", 1)[-1]
+        if vid == "GHSA-xxxx":
+            return {"id": "GHSA-xxxx", "aliases": ["CVE-2026-0001"]}
+        if vid == "EX-2026-9999":
+            return {"id": "EX-2026-9999", "aliases": ["CVE-2026-0001"]}
+        raise AssertionError(url)
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_post), patch(
+        "codeartifact_shield.audit._http_get_json", mock_get
+    ):
+        report = audit_lockfile(
+            lf,
+            osv_endpoints=("https://a.example", "https://b.example"),
+        )
+    assert len(report.findings) == 1
+    f = report.findings[0]
+    # Both records carry the same CVE alias → grouped. The lex-smallest of
+    # the two PRIMARY ids ("EX-2026-9999" < "GHSA-xxxx") is canonical.
+    assert f.vuln_id == "EX-2026-9999"
+    assert "GHSA-xxxx" in f.aliases
+    assert "CVE-2026-0001" in f.aliases
+
+
+def test_audit_dispatches_endpoint_chunk_cross_product_in_parallel(
+    tmp_path: Path,
+) -> None:
+    """Performance contract: with E endpoints × C chunks, wall time must be
+    bounded by max(per-call latency), not E·C·latency. Sleep-injected mock
+    proves the parallelism."""
+    import threading
+    import time
+
+    # 3 endpoints × 3 chunks (3000 packages / OSV_BATCH_SIZE=1000) = 9 calls.
+    pkg_count = 3000
+    pkgs = {
+        f"node_modules/pkg-{i:04d}": {"version": "1.0.0"} for i in range(pkg_count)
+    }
+    lf = _write_lock(tmp_path, pkgs)
+
+    in_flight = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def mock_post(
+        url: str, body: dict[str, Any], timeout: int, retries: int = 2
+    ) -> dict[str, Any]:
+        nonlocal in_flight, peak
+        with lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        time.sleep(0.1)  # simulate network latency
+        with lock:
+            in_flight -= 1
+        chunk_size = len(body["queries"])
+        return {"results": [{} for _ in range(chunk_size)]}
+
+    def mock_get(
+        url: str, timeout: int, auth_header: str | None = None, retries: int = 2
+    ) -> dict[str, Any]:
+        raise AssertionError("no vuln details expected")
+
+    endpoints = (
+        "https://ep1.example",
+        "https://ep2.example",
+        "https://ep3.example",
+    )
+    start = time.perf_counter()
+    with patch("codeartifact_shield.audit._http_post_json", mock_post), patch(
+        "codeartifact_shield.audit._http_get_json", mock_get
+    ):
+        report = audit_lockfile(lf, osv_endpoints=endpoints)
+    elapsed = time.perf_counter() - start
+    assert report.clean
+    # 9 calls × 100ms each = 900ms if serial. Parallelised, should be <300ms.
+    assert elapsed < 0.5, f"expected <500ms wall time, got {elapsed*1000:.0f}ms"
+    # At least 6 of the 9 calls should overlap (max workers allowing).
+    assert peak >= 6, f"expected peak ≥6 in-flight calls, got {peak}"

@@ -640,10 +640,11 @@ def registry_cmd(
     multiple=True,
     envvar="CAS_ALLOWED_SCRIPTS",
     help=(
-        "Package name (including scope, e.g. `@parcel/watcher`) that is "
-        "permitted to run install scripts. Repeatable. Build-essential "
-        "native modules (esbuild, fsevents, etc.) typically need this — "
-        "review and allowlist deliberately."
+        "Package permitted to run install scripts. Accepts `name` (e.g. "
+        "`@parcel/watcher` — all versions) or `name@version` (exact "
+        "version only — pin the install-script surface). Repeatable. "
+        "Build-essential native modules (esbuild, fsevents, etc.) "
+        "typically need this — review and allowlist deliberately."
     ),
 )
 @click.option(
@@ -969,12 +970,13 @@ _AUDIT_SEVERITY_TO_CAS = {
     multiple=True,
     envvar="CAS_ALLOW_PRIVATE",
     help=(
-        "Package name (including scope) permitted to be unauditable. "
-        "Repeatable. Shared with `cas cooldown` — set once via "
-        "`CAS_ALLOW_PRIVATE` to apply to both commands. Demotes the "
-        "HIGH `unaudited_private` finding to INFO for that name. Use "
-        "sparingly — prefer `--ca-domain` so CodeArtifact vouches for "
-        "an entire scope at once."
+        "Package permitted to be unauditable. Accepts `name` (all versions) "
+        "or `name@version` (exact version only). Examples: `@my/internal`, "
+        "`@my/internal@1.0.0`. Repeatable. Shared with `cas cooldown` — "
+        "set once via `CAS_ALLOW_PRIVATE` to apply to both commands. "
+        "Demotes the HIGH `unaudited_private` finding to INFO for the "
+        "matched (name, version) pair. Use sparingly — prefer `--ca-domain` "
+        "so CodeArtifact vouches for an entire scope at once."
     ),
 )
 @click.option(
@@ -1047,6 +1049,21 @@ _AUDIT_SEVERITY_TO_CAS = {
     ),
 )
 @click.option(
+    "--osv-endpoint",
+    "osv_endpoints",
+    multiple=True,
+    envvar="CAS_OSV_ENDPOINTS",
+    help=(
+        "OSV-compatible base URL (repeatable). cas dispatches the batch "
+        "query to every endpoint in parallel, unions the returned vuln "
+        "IDs per (name, version), and deduplicates cross-source findings "
+        "by alias overlap. The first endpoint listed wins as the "
+        "preferred detail-fetch source; others are tried as fallback on "
+        "transient failure. Default: a single entry pointing at "
+        "https://api.osv.dev. Env: CAS_OSV_ENDPOINTS (whitespace-separated)."
+    ),
+)
+@click.option(
     "--json",
     "json_output",
     is_flag=True,
@@ -1065,6 +1082,7 @@ def audit_cmd(
     max_workers: int,
     retries: int,
     probe_cache_path: Path | None,
+    osv_endpoints: tuple[str, ...],
     json_output: bool,
 ) -> None:
     """Query OSV.dev for known vulnerabilities in every (name, version) in the lockfile."""
@@ -1096,19 +1114,21 @@ def audit_cmd(
             sys.exit(1)
         trusted_endpoints.append(ca)
 
+    audit_kwargs: dict[str, Any] = {
+        "allow_ids": allowed,
+        "allow_unaudited": allow_unaudited,
+        "severity_floor": floor,
+        "whitelist_file": whitelist_file,
+        "probe_registry": probe_registry,
+        "trusted_endpoints": trusted_endpoints or None,
+        "probe_cache_path": probe_cache_path,
+        "max_workers": max_workers,
+        "retries": retries,
+    }
+    if osv_endpoints:
+        audit_kwargs["osv_endpoints"] = osv_endpoints
     try:
-        report = audit_lockfile(
-            lockfile,
-            allow_ids=allowed,
-            allow_unaudited=allow_unaudited,
-            severity_floor=floor,
-            whitelist_file=whitelist_file,
-            probe_registry=probe_registry,
-            trusted_endpoints=trusted_endpoints or None,
-            probe_cache_path=probe_cache_path,
-            max_workers=max_workers,
-            retries=retries,
-        )
+        report = audit_lockfile(lockfile, **audit_kwargs)
     except ValueError as exc:
         _emit_load_error(json_output, "audit", lockfile, exc)
         sys.exit(1)
@@ -1141,33 +1161,36 @@ def audit_cmd(
     findings_payload: list[dict[str, Any]] = []
     for f in report.findings:
         sev = _AUDIT_SEVERITY_TO_CAS.get(f.severity, Severity.LOW)
-        findings_payload.append(
-            {
-                "severity": sev.value,
-                "type": "vulnerability",
-                "package": f.package_name,
-                "version": f.version,
-                "vuln_id": f.vuln_id,
-                "vuln_severity": f.severity,
-                "summary": f.summary,
-                "fixed_in": f.fixed_in,
-                "aliases": f.aliases,
-            }
-        )
-    for name in report.unaudited_blocked:
+        payload: dict[str, Any] = {
+            "severity": sev.value,
+            "type": "vulnerability",
+            "package": f.package_name,
+            "version": f.version,
+            "vuln_id": f.vuln_id,
+            "vuln_severity": f.severity,
+            "summary": f.summary,
+            "fixed_in": f.fixed_in,
+            "aliases": f.aliases,
+        }
+        if f.source:
+            payload["source"] = f.source
+        findings_payload.append(payload)
+    for name, version in report.unaudited_blocked:
         findings_payload.append(
             {
                 "severity": Severity.HIGH.value,
                 "type": "unaudited_private",
                 "package": name,
+                "version": version,
             }
         )
-    for name in report.unaudited_allowed:
+    for name, version in report.unaudited_allowed:
         findings_payload.append(
             {
                 "severity": Severity.INFO.value,
                 "type": "unaudited_private_allowed",
                 "package": name,
+                "version": version,
             }
         )
 
@@ -1205,6 +1228,7 @@ def audit_cmd(
         cas_sev = _AUDIT_SEVERITY_TO_CAS.get(f.severity, Severity.LOW)
         aliases = f", aliases: {', '.join(f.aliases)}" if f.aliases else ""
         fixed = f"  Fixed in: {f.fixed_in}" if f.fixed_in else "  Fixed in: (no patch)"
+        source = f"    Source: {f.source}" if f.source else ""
         click.echo(
             f"  {severity_badge(cas_sev)} {f.package_name}@{f.version}  "
             f"{f.vuln_id}{aliases}",
@@ -1213,6 +1237,8 @@ def audit_cmd(
         if f.summary:
             click.echo(f"    {f.summary}", err=True)
         click.echo(fixed, err=True)
+        if source:
+            click.echo(source, err=True)
     click.echo(
         "\nFix: bump to the indicated `Fixed in` versions. To suppress an "
         "accepted-risk finding, pass `--allow <GHSA-id>` (repeat as needed) "
@@ -1248,9 +1274,10 @@ def audit_cmd(
     multiple=True,
     envvar="CAS_COOLDOWN_ALLOW",
     help=(
-        "Package name (including scope) permitted to ship without "
-        "a cooldown delay. Repeatable. Typical use: org-internal "
-        "packages where you control the publish."
+        "Package permitted to ship without a cooldown delay. Accepts "
+        "`name` (all versions) or `name@version` (exact version only). "
+        "Repeatable. Typical use: org-internal packages where you "
+        "control the publish."
     ),
 )
 @click.option(
@@ -1259,11 +1286,12 @@ def audit_cmd(
     multiple=True,
     envvar="CAS_ALLOW_PRIVATE",
     help=(
-        "Package name (including scope) permitted to be unresolvable on "
-        "every configured registry. Repeatable. Shared across `cas "
-        "cooldown` and `cas audit` — set once via `CAS_ALLOW_PRIVATE` "
-        "to apply to both. Use sparingly: a name no registry knows is "
-        "secure-by-default HIGH (typosquat / tampering / config gap)."
+        "Package permitted to be unresolvable on every configured "
+        "registry. Accepts `name` (all versions) or `name@version` "
+        "(exact version only). Repeatable. Shared across `cas cooldown` "
+        "and `cas audit` — set once via `CAS_ALLOW_PRIVATE` to apply to "
+        "both. Use sparingly: a name no registry knows is secure-by-"
+        "default HIGH (typosquat / tampering / config gap)."
     ),
 )
 @click.option(
