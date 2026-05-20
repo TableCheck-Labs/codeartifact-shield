@@ -25,7 +25,11 @@ from typing import Any
 
 from codeartifact_shield._allowlist import PackageAllowlist
 from codeartifact_shield._http import DEFAULT_RETRIES, with_retry
-from codeartifact_shield._lockfile import extract_package_name, load_lockfile
+from codeartifact_shield._lockfile import (
+    extract_package_name,
+    is_installable_entry,
+    load_lockfile,
+)
 from codeartifact_shield._registry import RegistryEndpoint, package_url
 
 OSV_DEFAULT_ENDPOINT = "https://api.osv.dev"
@@ -556,9 +560,7 @@ def audit_lockfile(
 
     seen: dict[tuple[str, str], None] = {}
     for key, entry in pkgs.items():
-        if not key:
-            continue
-        if entry.get("link"):
+        if not is_installable_entry(key, entry):
             continue
         name = extract_package_name(key, entry)
         version = entry.get("version")

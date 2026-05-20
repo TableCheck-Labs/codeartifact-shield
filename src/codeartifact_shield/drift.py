@@ -30,7 +30,7 @@ from typing import Any
 
 import nodesemver
 
-from codeartifact_shield._lockfile import load_lockfile
+from codeartifact_shield._lockfile import is_installable_entry, load_lockfile
 
 # nodesemver logs an INFO entry with a traceback for every range it can't parse
 # (e.g. ``github:org/repo#ref``, ``npm:other-name@^1.x``). We intercept the
@@ -200,11 +200,7 @@ def check_npm_drift(
     # ---- Transitive deps -----------------------------------------------------
     if transitive:
         for parent_key, parent_entry in lock_pkgs.items():
-            if not parent_key:
-                # The root entry mirrors package.json — already covered by the
-                # direct-deps loop above. Skip to avoid double-reporting.
-                continue
-            if parent_entry.get("link"):
+            if not is_installable_entry(parent_key, parent_entry):
                 continue
             for dep_kind in ("dependencies", "optionalDependencies", "peerDependencies"):
                 for child_name, declared_range in parent_entry.get(dep_kind, {}).items():
@@ -275,9 +271,7 @@ def _find_orphan_entries(
 
     orphans: list[str] = []
     for key, entry in lock_pkgs.items():
-        if not key:
-            continue
-        if entry.get("link"):
+        if not is_installable_entry(key, entry):
             continue
         if not entry.get("version"):
             continue

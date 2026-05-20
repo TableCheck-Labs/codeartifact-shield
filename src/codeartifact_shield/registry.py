@@ -25,6 +25,10 @@ from urllib.parse import urlparse
 from codeartifact_shield._lockfile import load_lockfile
 
 
+def _is_workspace_declaration(key: str, entry: dict[str, Any]) -> bool:
+    return bool(key) and not key.startswith("node_modules/") and not entry.get("link")
+
+
 @dataclass
 class RegistryReport:
     """Per-host breakdown of where a lockfile resolves its packages from."""
@@ -183,6 +187,8 @@ def check_npm_registry(
     for key, entry in pkgs.items():
         if not key or entry.get("link") or not entry.get("version"):
             continue
+        if _is_workspace_declaration(key, entry):
+            continue
         resolved = entry.get("resolved")
         if not resolved or resolved.startswith(
             ("file:", "./", "../", "/", "git+", "git:", "github:")
@@ -212,6 +218,8 @@ def check_npm_registry(
         if entry.get("link"):
             # Workspace symlinks resolve to file paths, not a registry.
             report.file_sourced.append(key)
+            continue
+        if _is_workspace_declaration(key, entry):
             continue
         if not entry.get("version"):
             continue

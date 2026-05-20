@@ -31,6 +31,34 @@ def load_lockfile(lockfile_path: Path) -> dict[str, Any]:
     return lock
 
 
+def is_installable_entry(key: str, entry: dict[str, Any]) -> bool:
+    """True iff this ``packages`` entry represents a real registry install.
+
+    npm v7+ lockfiles for workspace projects carry three classes of entry:
+
+    1. **The root** — empty-string key (``""``). The project itself.
+    2. **Workspace declarations** — keys like ``apps/foo``, ``libs/bar``,
+       ``system/i18n``. The workspace's own manifest. These have a real
+       ``version`` but they're NOT installed via the registry.
+    3. **Installed packages** — keys like ``node_modules/<name>`` or
+       ``node_modules/<a>/node_modules/<b>`` (and the workspace's own
+       symlink as ``node_modules/<workspace-name>`` with ``link: true``).
+       These are the things cas should examine.
+
+    Workspace declarations (class 2) regularly slipped past the
+    previous filter (only ``key == ""`` and ``link: true`` were
+    rejected) and got probed against the public registry, where they
+    don't exist — surfacing as bogus ``private_blocked`` /
+    ``unaudited_private`` / orphan findings. This helper closes that
+    gap by requiring the key to live under ``node_modules/``.
+    """
+    if not key:
+        return False
+    if not key.startswith("node_modules/"):
+        return False
+    return not entry.get("link")
+
+
 def extract_package_name(key: str, entry: dict[str, Any] | None = None) -> str:
     """Return the canonical npm package name for a lockfile entry.
 

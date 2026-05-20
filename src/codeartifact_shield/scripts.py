@@ -37,7 +37,11 @@ from pathlib import Path
 from typing import Any
 
 from codeartifact_shield._allowlist import PackageAllowlist
-from codeartifact_shield._lockfile import extract_package_name, load_lockfile
+from codeartifact_shield._lockfile import (
+    extract_package_name,
+    is_installable_entry,
+    load_lockfile,
+)
 
 
 @dataclass
@@ -97,9 +101,7 @@ def check_install_scripts(
 
     report = ScriptsReport()
     for key, entry in pkgs.items():
-        if not key:
-            continue
-        if entry.get("link"):
+        if not is_installable_entry(key, entry):
             continue
         if not entry.get("hasInstallScript"):
             continue

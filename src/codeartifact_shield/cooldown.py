@@ -51,7 +51,11 @@ from typing import Any
 
 from codeartifact_shield._allowlist import PackageAllowlist
 from codeartifact_shield._http import DEFAULT_RETRIES, with_retry
-from codeartifact_shield._lockfile import extract_package_name, load_lockfile
+from codeartifact_shield._lockfile import (
+    extract_package_name,
+    is_installable_entry,
+    load_lockfile,
+)
 from codeartifact_shield._registry import (
     RegistryEndpoint,
     build_codeartifact_endpoint,
@@ -327,9 +331,7 @@ def check_cooldown(
 
     pending: dict[tuple[str, str], None] = {}
     for key, entry in pkgs.items():
-        if not key:
-            continue
-        if entry.get("link"):
+        if not is_installable_entry(key, entry):
             continue
         name = extract_package_name(key, entry)
         version = entry.get("version")
