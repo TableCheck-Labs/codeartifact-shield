@@ -59,6 +59,17 @@ from codeartifact_shield.pins import DEFAULT_SCOPES, check_pinning
 from codeartifact_shield.registry import check_npm_registry, host_allowed
 from codeartifact_shield.scripts import check_install_scripts
 from codeartifact_shield.sri import patch_lockfile, verify_lockfile
+from codeartifact_shield.trust import (
+    DEFAULT_WORKERS as TRUST_DEFAULT_WORKERS,
+)
+from codeartifact_shield.trust import (
+    SignerPin,
+    TrustLevel,
+    _sigstore_available,
+    check_trust,
+    load_signer_manifest,
+    save_signer_manifest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -507,6 +518,16 @@ def drift_cmd(
     help="Also fail if any entry was resolved directly from git (bypasses the registry).",
 )
 @click.option(
+    "--fail-on-exotic",
+    is_flag=True,
+    envvar="CAS_FAIL_ON_EXOTIC",
+    help=(
+        "Fail if any entry was resolved from a non-registry source: "
+        "git repos, direct tarball URLs, or local file paths. "
+        "Implies --fail-on-git."
+    ),
+)
+@click.option(
     "--json",
     "json_output",
     is_flag=True,
@@ -516,6 +537,7 @@ def registry_cmd(
     lockfile: Path,
     allowed_hosts: tuple[str, ...],
     fail_on_git: bool,
+    fail_on_exotic: bool,
     json_output: bool,
 ) -> None:
     """Fail the build if the lockfile resolves any package from a non-allowed host."""
@@ -526,6 +548,8 @@ def registry_cmd(
     except ValueError as exc:
         _emit_load_error(json_output, "registry", lockfile, exc)
         sys.exit(1)
+
+    effective_fail_on_git = fail_on_git or fail_on_exotic
 
     findings: list[dict[str, Any]] = []
     for key, host in report.leaked:
@@ -546,6 +570,15 @@ def registry_cmd(
                 "ref": ref,
             }
         )
+    for key, url in report.tarball_sourced:
+        findings.append(
+            {
+                "severity": Severity.MEDIUM.value,
+                "type": "tarball_sourced",
+                "lockfile_key": key,
+                "url": url,
+            }
+        )
     for key in report.unresolved:
         findings.append(
             {
@@ -563,7 +596,11 @@ def registry_cmd(
             }
         )
 
-    is_failure = bool(report.leaked) or (fail_on_git and bool(report.git_sourced))
+    is_failure = bool(report.leaked)
+    if effective_fail_on_git and report.git_sourced:
+        is_failure = True
+    if fail_on_exotic and (report.tarball_sourced or report.file_sourced):
+        is_failure = True
 
     if json_output:
         emit_json(
@@ -608,19 +645,52 @@ def registry_cmd(
             click.echo(f"  ... and {len(report.leaked) - 30} more", err=True)
 
     if report.git_sourced:
-        sev = Severity.MEDIUM if fail_on_git else Severity.LOW
+        sev = Severity.MEDIUM if effective_fail_on_git else Severity.LOW
         click.echo(
             f"\nGit-sourced entries (bypass registry) ({len(report.git_sourced)}):",
-            err=fail_on_git,
+            err=effective_fail_on_git,
         )
         for k, ref in report.git_sourced[:10]:
             click.echo(
                 f"  {severity_badge(sev)} {k}  <-  {ref}",
-                err=fail_on_git,
+                err=effective_fail_on_git,
             )
         if len(report.git_sourced) > 10:
             click.echo(
-                f"  ... and {len(report.git_sourced) - 10} more", err=fail_on_git
+                f"  ... and {len(report.git_sourced) - 10} more",
+                err=effective_fail_on_git,
+            )
+
+    if report.tarball_sourced:
+        sev = Severity.MEDIUM if fail_on_exotic else Severity.LOW
+        click.echo(
+            f"\nTarball-sourced entries (bypass registry API) "
+            f"({len(report.tarball_sourced)}):",
+            err=fail_on_exotic,
+        )
+        for k, url in report.tarball_sourced[:10]:
+            click.echo(
+                f"  {severity_badge(sev)} {k}  <-  {url}",
+                err=fail_on_exotic,
+            )
+        if len(report.tarball_sourced) > 10:
+            click.echo(
+                f"  ... and {len(report.tarball_sourced) - 10} more",
+                err=fail_on_exotic,
+            )
+
+    if report.file_sourced and fail_on_exotic:
+        click.echo(
+            f"\nFile/link-sourced entries ({len(report.file_sourced)}):",
+            err=True,
+        )
+        for k in report.file_sourced[:10]:
+            click.echo(
+                f"  {severity_badge(Severity.MEDIUM)} {k}", err=True
+            )
+        if len(report.file_sourced) > 10:
+            click.echo(
+                f"  ... and {len(report.file_sourced) - 10} more", err=True
             )
 
     if is_failure:
@@ -1590,3 +1660,312 @@ def cooldown_cmd(
     click.echo(
         f"OK — {report.total_checked} packages audited, all ≥ {min_age_days} days old."
     )
+
+
+# ---------------------------------------------------------------------------
+# trust — npm attestation / provenance verification
+# ---------------------------------------------------------------------------
+
+
+@main.command("trust")
+@click.argument("lockfile", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--policy",
+    type=click.Choice(["audit", "no-downgrade", "require-provenance"]),
+    default="audit",
+    help=(
+        "audit: report trust levels. "
+        "no-downgrade: fail if any package's trust degraded vs. its previous version. "
+        "require-provenance: fail if any package lacks provenance attestation."
+    ),
+)
+@click.option(
+    "--registry",
+    default="https://registry.npmjs.org",
+    envvar="CAS_TRUST_REGISTRY",
+    help="npm registry URL for fetching attestations (default: public npm).",
+)
+@click.option(
+    "--allow",
+    "allowed",
+    multiple=True,
+    envvar="CAS_TRUST_ALLOW",
+    help="Package name or name@version exempt from trust checks. Repeatable.",
+)
+@click.option(
+    "--allow-private",
+    "allow_private",
+    multiple=True,
+    envvar="CAS_TRUST_ALLOW_PRIVATE",
+    help="Private packages (will 404 on public npm). Repeatable.",
+)
+@click.option(
+    "--max-workers",
+    type=int,
+    default=TRUST_DEFAULT_WORKERS,
+    envvar="CAS_TRUST_MAX_WORKERS",
+    help=f"Max parallel attestation fetches (default {TRUST_DEFAULT_WORKERS}).",
+)
+@click.option(
+    "--retries",
+    type=int,
+    default=DEFAULT_RETRIES,
+    envvar="CAS_RETRIES",
+)
+@click.option(
+    "--verify-signatures",
+    is_flag=True,
+    envvar="CAS_TRUST_VERIFY_SIGNATURES",
+    help=(
+        "Verify sigstore signatures on provenance attestations. "
+        "Requires the 'sigstore' package (pip install codeartifact-shield[trust])."
+    ),
+)
+@click.option(
+    "--signers-file",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    envvar="CAS_TRUST_SIGNERS_FILE",
+    help=(
+        "Path to signer manifest JSON. When used with --verify-signatures, "
+        "each package's provenance signer is verified against its pinned "
+        "identity. A mismatch (different workflow or issuer) fails the build."
+    ),
+)
+@click.option(
+    "--update-signers",
+    is_flag=True,
+    help=(
+        "Learn mode: write/update the signer manifest with identities "
+        "observed from the current lockfile. Requires --signers-file."
+    ),
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Emit machine-readable JSON on stdout.",
+)
+def trust_cmd(
+    lockfile: Path,
+    policy: str,
+    registry: str,
+    allowed: tuple[str, ...],
+    allow_private: tuple[str, ...],
+    max_workers: int,
+    retries: int,
+    verify_signatures: bool,
+    signers_file: Path | None,
+    update_signers: bool,
+    json_output: bool,
+) -> None:
+    """Verify npm package attestations and detect trust-level downgrades."""
+    if (verify_signatures or update_signers) and not _sigstore_available():
+        click.echo(
+            "Error: --verify-signatures/--update-signers requires the 'sigstore' "
+            "package. Install with: pip install codeartifact-shield[trust]",
+            err=True,
+        )
+        sys.exit(1)
+
+    if update_signers and not signers_file:
+        click.echo("Error: --update-signers requires --signers-file.", err=True)
+        sys.exit(1)
+
+    if update_signers:
+        verify_signatures = True
+
+    manifest = load_signer_manifest(signers_file) if signers_file else None
+
+    try:
+        report = check_trust(
+            lockfile,
+            policy=policy,
+            registry=registry,
+            allow=allowed,
+            allow_private=allow_private,
+            verify_signatures=verify_signatures,
+            signer_manifest=manifest if signers_file else None,
+            max_workers=max_workers,
+            retries=retries,
+        )
+    except ValueError as exc:
+        _emit_load_error(json_output, "trust", lockfile, exc)
+        sys.exit(1)
+
+    findings: list[dict[str, Any]] = []
+    for f in report.findings:
+        entry: dict[str, Any] = {
+            "package_name": f.package_name,
+            "version": f.version,
+            "trust_level": f.trust_level.label,
+        }
+        if f.previous_version is not None:
+            entry["previous_version"] = f.previous_version
+            entry["previous_trust_level"] = (
+                f.previous_trust_level.label
+                if f.previous_trust_level is not None
+                else None
+            )
+        if f.signature is not None:
+            entry["signature"] = {
+                "verified": f.signature.verified,
+                "signer_identity": f.signature.signer_identity,
+                "signer_issuer": f.signature.signer_issuer,
+                "error": f.signature.error,
+            }
+        if f.pinned_identity:
+            entry["pinned_identity"] = f.pinned_identity
+        if f.signer_changed:
+            entry["severity"] = Severity.CRITICAL.value
+            entry["type"] = "signer_changed"
+        elif f.downgrade:
+            entry["severity"] = Severity.HIGH.value
+            entry["type"] = "trust_downgrade"
+        elif f.signature is not None and not f.signature.verified:
+            entry["severity"] = Severity.HIGH.value
+            entry["type"] = "signature_invalid"
+        elif f.trust_level == TrustLevel.NONE:
+            entry["severity"] = Severity.LOW.value
+            entry["type"] = "no_attestation"
+        else:
+            entry["severity"] = Severity.INFO.value
+            entry["type"] = "attested"
+        findings.append(entry)
+
+    # --update-signers: write observed identities back to manifest.
+    if update_signers and signers_file:
+        updated = dict(manifest) if manifest else {}
+        for f in report.findings:
+            if (
+                f.signature is not None
+                and f.signature.verified
+                and f.signature.signer_identity
+                and f.signature.signer_issuer
+            ):
+                updated[f.package_name] = SignerPin(
+                    identity=f.signature.signer_identity,
+                    issuer=f.signature.signer_issuer,
+                )
+        save_signer_manifest(signers_file, updated)
+        if not json_output:
+            click.echo(
+                f"Updated {signers_file} with {len(updated)} signer pins."
+            )
+
+    is_failure = False
+    if policy == "no-downgrade" and report.downgrades:
+        is_failure = True
+    if policy == "require-provenance":
+        missing_provenance = [
+            f
+            for f in report.findings
+            if f.trust_level
+            in (TrustLevel.NONE, TrustLevel.PUBLISH_ONLY)
+        ]
+        if missing_provenance:
+            is_failure = True
+    if verify_signatures:
+        sig_failures = [
+            f for f in report.findings
+            if f.signature is not None and not f.signature.verified
+        ]
+        if sig_failures:
+            is_failure = True
+    signer_changes = [f for f in report.findings if f.signer_changed]
+    if signer_changes:
+        is_failure = True
+
+    if json_output:
+        emit_json(
+            {
+                "command": "trust",
+                "lockfile": str(lockfile),
+                "policy": policy,
+                "clean": not is_failure,
+                "total_checked": report.total_checked,
+                "findings": findings,
+                "severity_counts": severity_counts(findings),
+                "network_errors": report.network_errors,
+            }
+        )
+        if is_failure:
+            sys.exit(1)
+        return
+
+    click.echo(f"Trust audit: {report.total_checked} packages checked (policy: {policy})")
+
+    if signer_changes:
+        click.echo(f"\nSigner changes ({len(signer_changes)}):", err=True)
+        for f in signer_changes:
+            actual = f.signature.signer_identity if f.signature else "none"
+            click.echo(
+                f"  {severity_badge(Severity.CRITICAL)} {f.package_name}@{f.version}: "
+                f"pinned={f.pinned_identity}  actual={actual}",
+                err=True,
+            )
+
+    if report.network_errors:
+        click.echo(f"\nNetwork errors ({len(report.network_errors)}):", err=True)
+        for err in report.network_errors[:5]:
+            click.echo(f"  {err}", err=True)
+
+    if report.downgrades:
+        click.echo(f"\nTrust downgrades ({len(report.downgrades)}):", err=True)
+        for f in report.downgrades:
+            click.echo(
+                f"  {severity_badge(Severity.HIGH)} {f.package_name}@{f.version}: "
+                f"{f.previous_trust_level.label if f.previous_trust_level else '?'} → "
+                f"{f.trust_level.label} "
+                f"(previous: {f.previous_version})",
+                err=True,
+            )
+
+    if report.no_attestation:
+        sev = Severity.MEDIUM if policy == "require-provenance" else Severity.LOW
+        click.echo(
+            f"\nNo attestations ({len(report.no_attestation)}):",
+            err=policy == "require-provenance",
+        )
+        for f in report.no_attestation[:20]:
+            click.echo(
+                f"  {severity_badge(sev)} {f.package_name}@{f.version}",
+                err=policy == "require-provenance",
+            )
+        if len(report.no_attestation) > 20:
+            click.echo(
+                f"  ... and {len(report.no_attestation) - 20} more",
+                err=policy == "require-provenance",
+            )
+
+    if verify_signatures:
+        sig_failures = [
+            f for f in report.findings
+            if f.signature is not None and not f.signature.verified
+        ]
+        sig_verified = [
+            f for f in report.findings
+            if f.signature is not None and f.signature.verified
+        ]
+        if sig_verified:
+            click.echo(f"\nSignatures verified ({len(sig_verified)}):")
+            for f in sig_verified[:10]:
+                identity = f.signature.signer_identity or "unknown" if f.signature else "?"
+                click.echo(
+                    f"  {severity_badge(Severity.INFO)} {f.package_name}@{f.version} "
+                    f"signed by {identity}",
+                )
+        if sig_failures:
+            click.echo(f"\nSignature failures ({len(sig_failures)}):", err=True)
+            for f in sig_failures:
+                err_msg = f.signature.error if f.signature else "?"
+                click.echo(
+                    f"  {severity_badge(Severity.HIGH)} {f.package_name}@{f.version}: "
+                    f"{err_msg}",
+                    err=True,
+                )
+
+    if is_failure:
+        sys.exit(1)
+
+    click.echo(f"\nOK — {report.total_checked} packages, policy '{policy}' satisfied.")

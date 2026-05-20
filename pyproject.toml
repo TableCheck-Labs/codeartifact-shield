@@ -1,6 +1,6 @@
 [project]
 name = "codeartifact-shield"
-version = "0.8.1"
+version = "0.9.0"
 description = "npm supply-chain hardening for AWS CodeArtifact: backfills the SRI integrity hashes CodeArtifact strips from package-lock.json, and fails the build on package.json/lockfile drift."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -29,6 +29,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+trust = [
+    "sigstore>=4.0.0",
+]
 dev = [
     "pytest==9.0.3",
     "pytest-cov==7.1.0",
@@ -67,6 +70,10 @@ warn_redundant_casts = true
 
 [[tool.mypy.overrides]]
 module = "nodesemver"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["sigstore.*", "cryptography.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

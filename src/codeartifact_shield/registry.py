@@ -42,6 +42,11 @@ class RegistryReport:
     git_sourced: list[tuple[str, str]] = field(default_factory=list)
     """``(lockfile_key, ref)`` — entries pulled directly from git, bypassing any registry."""
 
+    tarball_sourced: list[tuple[str, str]] = field(default_factory=list)
+    """``(lockfile_key, url)`` — entries resolved from an HTTPS URL that doesn't
+    follow the standard npm registry tarball convention (``/-/`` path segment).
+    These are direct tarball downloads that bypass the registry package API."""
+
     file_sourced: list[str] = field(default_factory=list)
     """Workspace / local-path entries — neither a registry resolution nor a leak."""
 
@@ -69,7 +74,7 @@ class RegistryReport:
 
     @property
     def clean(self) -> bool:
-        return not self.leaked and not self.git_sourced
+        return not self.leaked and not self.git_sourced and not self.tarball_sourced
 
     @property
     def mixed(self) -> bool:
@@ -199,6 +204,8 @@ def check_npm_registry(
         parsed = urlparse(resolved)
         if parsed.scheme != "https":
             continue
+        if "/-/" not in (parsed.path or ""):
+            continue
         host = parsed.hostname or "(unknown)"
         histogram[host] = histogram.get(host, 0) + 1
 
@@ -238,6 +245,9 @@ def check_npm_registry(
             continue
         parsed = urlparse(resolved)
         host = parsed.hostname or "(unknown)"
+        if parsed.scheme == "https" and "/-/" not in (parsed.path or ""):
+            report.tarball_sourced.append((key, resolved))
+            continue
         report.by_host[host] = report.by_host.get(host, 0) + 1
         # Enforce https://. http:// is MITM-able on any untrusted hop between
         # the install machine and the registry; other schemes (ftp://, ws://,

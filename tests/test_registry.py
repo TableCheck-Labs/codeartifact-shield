@@ -467,3 +467,103 @@ def test_unknown_scheme_resolved_url_is_leaked(tmp_path: Path) -> None:
     report = check_npm_registry(lf, [".d.codeartifact.us-east-1.amazonaws.com"])
     assert not report.clean
     assert report.leaked, "ftp:// must be classified as leaked"
+
+
+# ---------------------------------------------------------------------------
+# Tarball-sourced detection: HTTPS URLs without the standard npm `/-/` path
+# segment are direct tarball downloads that bypass the registry package API.
+# ---------------------------------------------------------------------------
+
+
+def test_tarball_url_classified_as_tarball_sourced(tmp_path: Path) -> None:
+    """An HTTPS URL without ``/-/`` in the path is a direct tarball download."""
+    lf = _write(
+        tmp_path,
+        {
+            "node_modules/custom-build": {
+                "version": "1.0.0",
+                "resolved": "https://example.com/releases/custom-build-1.0.0.tgz",
+            },
+        },
+    )
+    report = check_npm_registry(lf, ["example.com"])
+    assert not report.clean
+    assert report.tarball_sourced == [
+        ("node_modules/custom-build", "https://example.com/releases/custom-build-1.0.0.tgz")
+    ]
+    assert report.leaked == []
+
+
+def test_github_release_tarball_classified_as_tarball_sourced(tmp_path: Path) -> None:
+    """GitHub releases download URLs bypass the registry API."""
+    lf = _write(
+        tmp_path,
+        {
+            "node_modules/fork": {
+                "version": "2.0.0",
+                "resolved": "https://github.com/user/repo/releases/download/v2/fork-2.0.0.tgz",
+            },
+        },
+    )
+    report = check_npm_registry(lf, ["registry.npmjs.org"])
+    assert len(report.tarball_sourced) == 1
+    assert report.tarball_sourced[0][0] == "node_modules/fork"
+
+
+def test_registry_url_with_dash_segment_not_tarball(tmp_path: Path) -> None:
+    """Standard registry URL (has ``/-/`` in path) must NOT be tarball-sourced."""
+    lf = _write(
+        tmp_path,
+        {
+            "node_modules/lodash": {
+                "version": "4.17.21",
+                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+            },
+        },
+    )
+    report = check_npm_registry(lf, ["registry.npmjs.org"])
+    assert report.clean
+    assert report.tarball_sourced == []
+    assert report.by_host == {"registry.npmjs.org": 1}
+
+
+def test_tarball_sourced_excluded_from_histogram(tmp_path: Path) -> None:
+    """Tarball URLs must not inflate the host-distribution histogram (would
+    skew auto-detect)."""
+    pkgs = {
+        f"node_modules/p{i}": {
+            "version": "1.0.0",
+            "resolved": f"https://registry.npmjs.org/p{i}/-/p{i}-1.0.0.tgz",
+        }
+        for i in range(5)
+    }
+    pkgs["node_modules/direct"] = {
+        "version": "1.0.0",
+        "resolved": "https://registry.npmjs.org/direct/download/direct-1.0.0.tgz",
+    }
+    lf = _write(tmp_path, pkgs)
+    report = check_npm_registry(lf, allowed_hosts=None)
+    assert report.by_host == {"registry.npmjs.org": 5}
+    assert len(report.tarball_sourced) == 1
+
+
+def test_mixed_registry_and_tarball_sources(tmp_path: Path) -> None:
+    """Registry entries are classified normally; tarball entry is separate."""
+    lf = _write(
+        tmp_path,
+        {
+            "node_modules/lodash": {
+                "version": "4.17.21",
+                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+            },
+            "node_modules/custom": {
+                "version": "1.0.0",
+                "resolved": "https://builds.internal/custom-1.0.0.tgz",
+            },
+        },
+    )
+    report = check_npm_registry(lf, ["registry.npmjs.org"])
+    assert not report.clean
+    assert report.leaked == []
+    assert report.by_host == {"registry.npmjs.org": 1}
+    assert len(report.tarball_sourced) == 1

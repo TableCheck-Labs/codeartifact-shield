@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from click.testing import CliRunner
 
 from codeartifact_shield.cli import main
+from codeartifact_shield.trust import PROVENANCE_PREDICATE, PUBLISH_PREDICATE
 
 
 def _write_lock(tmp_path: Path, packages: dict[str, dict]) -> Path:
@@ -349,6 +351,88 @@ def test_json_output_is_parseable(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# --fail-on-exotic: unified exotic-source failure mode
+# ---------------------------------------------------------------------------
+
+
+def test_fail_on_exotic_exits_nonzero_on_tarball(tmp_path: Path) -> None:
+    lf = _write_lock(
+        tmp_path,
+        {
+            "node_modules/custom": {
+                "version": "1.0.0",
+                "resolved": "https://builds.internal/custom-1.0.0.tgz",
+            },
+        },
+    )
+    result = CliRunner().invoke(
+        main,
+        ["registry", str(lf), "--fail-on-exotic", "--json"],
+    )
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    types = [f["type"] for f in payload["findings"]]
+    assert "tarball_sourced" in types
+
+
+def test_fail_on_exotic_implies_fail_on_git(tmp_path: Path) -> None:
+    lf = _write_lock(
+        tmp_path,
+        {
+            "node_modules/forked": {
+                "version": "1.0.0",
+                "resolved": "git+ssh://git@github.com/x/y.git#abc",
+            },
+        },
+    )
+    result = CliRunner().invoke(
+        main,
+        ["registry", str(lf), "--fail-on-exotic", "--json"],
+    )
+    assert result.exit_code == 1
+
+
+def test_fail_on_exotic_clean_when_all_registry(tmp_path: Path) -> None:
+    lf = _write_lock(
+        tmp_path,
+        {
+            "node_modules/lodash": {
+                "version": "4.17.21",
+                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+            },
+        },
+    )
+    result = CliRunner().invoke(
+        main,
+        ["registry", str(lf), "--fail-on-exotic", "--json"],
+    )
+    assert result.exit_code == 0
+
+
+def test_tarball_sourced_in_json_output(tmp_path: Path) -> None:
+    lf = _write_lock(
+        tmp_path,
+        {
+            "node_modules/custom": {
+                "version": "1.0.0",
+                "resolved": "https://example.com/custom-1.0.0.tgz",
+            },
+        },
+    )
+    result = CliRunner().invoke(
+        main,
+        ["registry", str(lf), "--json"],
+    )
+    payload = json.loads(result.stdout)
+    tarball_findings = [
+        f for f in payload["findings"] if f["type"] == "tarball_sourced"
+    ]
+    assert len(tarball_findings) == 1
+    assert tarball_findings[0]["severity"] == "MEDIUM"
+    assert "url" in tarball_findings[0]
+
+
+# ---------------------------------------------------------------------------
 # pin — direct-dep pinning policy audit
 # ---------------------------------------------------------------------------
 
@@ -460,3 +544,104 @@ def test_pin_missing_package_json_clean_error(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert payload["findings"][0]["type"] == "missing_package_json"
     assert payload["findings"][0]["severity"] == "HIGH"
+
+
+# ---------------------------------------------------------------------------
+# trust — npm attestation / provenance verification
+# ---------------------------------------------------------------------------
+
+
+def _mock_attestation(predicates: list[str]) -> dict:
+    return {"attestations": [{"predicateType": p, "bundle": {}} for p in predicates]}
+
+
+def test_trust_audit_json_structure(tmp_path: Path) -> None:
+    lf = _write_lock(
+        tmp_path,
+        {
+            "": {"name": "root", "version": "0.0.0"},
+            "node_modules/pkg": {
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz",
+            },
+        },
+    )
+
+    def mock_get(url: str, timeout: int, retries: int = 2) -> dict | None:
+        if "attestations/" in url:
+            return _mock_attestation([PROVENANCE_PREDICATE, PUBLISH_PREDICATE])
+        return None
+
+    with patch("codeartifact_shield.trust._http_get_json", mock_get):
+        result = CliRunner().invoke(
+            main, ["trust", str(lf), "--json"]
+        )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["command"] == "trust"
+    assert payload["policy"] == "audit"
+    assert payload["clean"] is True
+    assert payload["total_checked"] == 1
+    assert payload["findings"][0]["trust_level"] == "provenance+publish"
+
+
+def test_trust_no_downgrade_exits_nonzero(tmp_path: Path) -> None:
+    lf = _write_lock(
+        tmp_path,
+        {
+            "": {"name": "root", "version": "0.0.0"},
+            "node_modules/regressed": {
+                "version": "2.0.0",
+                "resolved": "https://registry.npmjs.org/regressed/-/regressed-2.0.0.tgz",
+            },
+        },
+    )
+    packument = {"versions": {"1.0.0": {}, "2.0.0": {}}}
+
+    def mock_get(url: str, timeout: int, retries: int = 2) -> dict | None:
+        if "attestations/regressed@2.0.0" in url:
+            return _mock_attestation([PUBLISH_PREDICATE])
+        if "attestations/regressed@1.0.0" in url:
+            return _mock_attestation([PROVENANCE_PREDICATE, PUBLISH_PREDICATE])
+        if url.endswith("/regressed"):
+            return packument
+        return None
+
+    with patch("codeartifact_shield.trust._http_get_json", mock_get):
+        result = CliRunner().invoke(
+            main, ["trust", str(lf), "--policy", "no-downgrade", "--json"]
+        )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["clean"] is False
+    downgrades = [f for f in payload["findings"] if f.get("type") == "trust_downgrade"]
+    assert len(downgrades) == 1
+    assert downgrades[0]["severity"] == "HIGH"
+
+
+def test_trust_require_provenance_fails_on_none(tmp_path: Path) -> None:
+    lf = _write_lock(
+        tmp_path,
+        {
+            "": {"name": "root", "version": "0.0.0"},
+            "node_modules/unattested": {
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/unattested/-/unattested-1.0.0.tgz",
+            },
+        },
+    )
+
+    def mock_get(url: str, timeout: int, retries: int = 2) -> dict | None:
+        return None
+
+    with patch("codeartifact_shield.trust._http_get_json", mock_get):
+        result = CliRunner().invoke(
+            main,
+            ["trust", str(lf), "--policy", "require-provenance", "--json"],
+        )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["clean"] is False
