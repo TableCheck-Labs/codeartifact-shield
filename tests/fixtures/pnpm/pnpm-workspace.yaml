@@ -1,0 +1,5 @@
+packages:
+  - 'packages/*'
+onlyBuiltDependencies:
+  - esbuild
+minimumReleaseAge: 1440

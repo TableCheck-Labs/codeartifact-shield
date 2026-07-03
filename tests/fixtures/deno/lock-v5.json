@@ -1,0 +1,42 @@
+{
+  "version": "5",
+  "specifiers": {
+    "npm:chalk@^5": "5.3.0",
+    "jsr:@std/assert@^1": "1.0.0"
+  },
+  "npm": {
+    "chalk@5.3.0": {
+      "integrity": "sha512-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa==",
+      "dependencies": [
+        "ansi-styles@6.2.1"
+      ]
+    },
+    "ansi-styles@6.2.1": {
+      "integrity": "sha512-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb==",
+      "dependencies": []
+    }
+  },
+  "jsr": {
+    "@std/assert@1.0.0": {
+      "integrity": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "dependencies": [
+        "jsr:@std/internal@^1.0.0"
+      ]
+    },
+    "@std/internal@1.0.0": {
+      "integrity": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  },
+  "remote": {
+    "https://deno.land/std@0.220.1/assert/assert.ts": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "redirects": {
+    "https://deno.land/x/foo/mod.ts": "https://cdn.other-host.example/foo/mod.ts"
+  },
+  "workspace": {
+    "dependencies": [
+      "npm:chalk@^5",
+      "jsr:@std/assert@^1"
+    ]
+  }
+}

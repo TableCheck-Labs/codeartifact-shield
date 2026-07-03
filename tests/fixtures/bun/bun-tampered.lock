@@ -1,0 +1,9 @@
+{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": { "name": "root", "dependencies": { "evil": "1.0.0" } }
+  },
+  "packages": {
+    "../../etc/evil": ["evil@1.0.0", "", {}, "sha512-Wu1VHeILBK8KAWJUAiSZQX94GmOE45Rg6/538fKwiloUu21KncEkYGPqob2oSZ5mUT73vLGrHQjKw3KMPwfDzg=="]
+  }
+}

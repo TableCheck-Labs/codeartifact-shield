@@ -1,0 +1,10 @@
+lockfileVersion: '5.4'
+
+dependencies:
+  foo: 1.0.0
+
+packages:
+
+  /foo/1.0.0:
+    resolution: {integrity: sha512-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa==}
+    dev: false

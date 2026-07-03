@@ -28,8 +28,9 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 
 import click
 
@@ -54,9 +55,15 @@ from codeartifact_shield.cooldown import (
     build_codeartifact_endpoint,
     check_cooldown,
 )
-from codeartifact_shield.drift import check_npm_drift
-from codeartifact_shield.pins import DEFAULT_SCOPES, check_pinning
-from codeartifact_shield.registry import check_npm_registry, host_allowed
+from codeartifact_shield.drift import check_drift
+from codeartifact_shield.lockfiles import (
+    SUPPORT_NOTES,
+    LockFormat,
+    UnsupportedLockfileOperation,
+    detect_format,
+)
+from codeartifact_shield.pins import DEFAULT_SCOPES, check_deno_pinning, check_pinning
+from codeartifact_shield.registry import check_registry, host_allowed
 from codeartifact_shield.scripts import check_install_scripts
 from codeartifact_shield.sri import patch_lockfile, verify_lockfile
 from codeartifact_shield.trust import (
@@ -72,6 +79,28 @@ from codeartifact_shield.trust import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _format_fields(path: Path, fmt: LockFormat | None) -> dict[str, str]:
+    """Return the additive ``lockfile_format`` / ``format_version`` JSON fields.
+
+    Best-effort: a full parse yields both; detection-only yields the format with
+    an empty version; total failure degrades to ``"unknown"`` rather than raising
+    (the command's own error path already reported the real failure).
+    """
+    from codeartifact_shield.lockfiles import load_normalized
+
+    try:
+        normalized = load_normalized(path, fmt)
+        return {
+            "lockfile_format": normalized.format.value,
+            "format_version": normalized.format_version,
+        }
+    except Exception:  # noqa: BLE001 - purely decorative metadata
+        try:
+            return {"lockfile_format": detect_format(path).value, "format_version": ""}
+        except Exception:  # noqa: BLE001
+            return {"lockfile_format": "unknown", "format_version": ""}
 
 
 def _emit_load_error(
@@ -104,6 +133,91 @@ def _emit_load_error(
         click.echo(
             f"{severity_badge(Severity.HIGH)} FAIL — {exc}", err=True
         )
+
+
+_FORMAT_CHOICES = ["auto", "npm", "pnpm", "deno", "bun"]
+
+# Fixed probe order for the directory commands (drift / pin). Deno lands last so
+# a project that carries both a package.json and a deno.json still resolves to
+# the npm/pnpm/bun lockfile first.
+_DIR_LOCKFILES: list[tuple[str, LockFormat]] = [
+    ("package-lock.json", LockFormat.NPM),
+    ("pnpm-lock.yaml", LockFormat.PNPM),
+    ("bun.lock", LockFormat.BUN),
+    ("deno.lock", LockFormat.DENO),
+]
+
+
+_F = TypeVar("_F")
+
+
+def _format_option() -> Callable[[_F], _F]:
+    """The shared ``--format`` option (reused across every lockfile command)."""
+    return cast(
+        "Callable[[_F], _F]",
+        click.option(
+            "--format",
+            "lockfile_format",
+            type=click.Choice(_FORMAT_CHOICES),
+            default="auto",
+            envvar="CAS_LOCKFILE_FORMAT",
+            show_default=True,
+            help=(
+                "Lockfile format. 'auto' detects from filename then content. "
+                "Env: CAS_LOCKFILE_FORMAT."
+            ),
+        ),
+    )
+
+
+def _resolve_fmt(lockfile_format: str) -> LockFormat | None:
+    """Map the ``--format`` string to a ``LockFormat`` (None means auto-detect)."""
+    if lockfile_format == "auto":
+        return None
+    return LockFormat(lockfile_format)
+
+
+_REGEN_COMMANDS: dict[LockFormat, str] = {
+    LockFormat.NPM: "npm install --package-lock-only --include=optional --force",
+    LockFormat.PNPM: "pnpm install --lockfile-only",
+    LockFormat.DENO: "deno install",
+    LockFormat.BUN: "bun install --save-text-lockfile",
+}
+"""Per-format command that regenerates the lockfile from the manifest.
+
+The npm ``--force`` matters — without it, npm prunes foreign-platform
+optional deps from the lockfile (npm/cli#4828, #7961).
+"""
+
+
+def _dir_lockfile_path(project_dir: Path, fmt: LockFormat) -> Path:
+    """Return the conventional lockfile path for ``fmt`` inside ``project_dir``."""
+    for fname, candidate in _DIR_LOCKFILES:
+        if candidate is fmt:
+            return project_dir / fname
+    return project_dir / "package-lock.json"
+
+
+def _probe_dir_format(project_dir: Path, lockfile_format: str) -> LockFormat:
+    """Resolve the lockfile format for a directory command (drift / pin).
+
+    ``auto`` probes the fixed lockfile order and errors if more than one is
+    present, forcing the user to disambiguate with ``--format``.
+    """
+    forced = _resolve_fmt(lockfile_format)
+    if forced is not None:
+        return forced
+    present = [(fname, fmt) for fname, fmt in _DIR_LOCKFILES if (project_dir / fname).exists()]
+    if len(present) > 1:
+        names = ", ".join(fname for fname, _ in present)
+        raise UnsupportedLockfileOperation(
+            f"multiple lockfiles found in {project_dir}: {names}; "
+            f"disambiguate with --format"
+        )
+    if not present:
+        # Fall back to npm — matches the historical FileNotFoundError message.
+        return LockFormat.NPM
+    return present[0][1]
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -142,6 +256,7 @@ def sri() -> None:
     is_flag=True,
     help="Report what would be patched without writing the lockfile.",
 )
+@_format_option()
 @click.option(
     "--json",
     "json_output",
@@ -153,6 +268,7 @@ def sri_patch(
     domain: str,
     repository: str,
     dry_run: bool,
+    lockfile_format: str,
     json_output: bool,
 ) -> None:
     """Inject ``dist.integrity`` into every lockfile entry that's missing it.
@@ -164,6 +280,22 @@ def sri_patch(
     Exits 0 on success, 2 if there were API errors or packages
     unreachable in CodeArtifact, 1 on configuration errors.
     """
+    fmt = _resolve_fmt(lockfile_format)
+    try:
+        detected = fmt or detect_format(lockfile)
+    except UnsupportedLockfileOperation as exc:
+        _emit_load_error(json_output, "sri-patch", lockfile, exc)
+        sys.exit(1)
+    if detected is not LockFormat.NPM:
+        note = SUPPORT_NOTES.get(detected, {}).get(
+            "sri-patch",
+            f"sri patch is npm-only; {detected.value} lockfiles are unsupported",
+        )
+        _emit_load_error(
+            json_output, "sri-patch", lockfile, UnsupportedLockfileOperation(note)
+        )
+        sys.exit(1)
+
     report = patch_lockfile(
         lockfile, domain=domain, repository=repository, dry_run=dry_run
     )
@@ -192,6 +324,7 @@ def sri_patch(
             {
                 "command": "sri-patch",
                 "lockfile": str(lockfile),
+                **_format_fields(lockfile, fmt),
                 "clean": not findings,
                 "patched": report.patched,
                 "already_present": report.already_present,
@@ -233,20 +366,24 @@ def sri_patch(
     show_default=True,
     help="Minimum percentage of entries that must have an integrity hash.",
 )
+@_format_option()
 @click.option(
     "--json",
     "json_output",
     is_flag=True,
     help="Emit a machine-readable JSON report on stdout instead of human text.",
 )
-def sri_verify(lockfile: Path, min_coverage: float, json_output: bool) -> None:
+def sri_verify(
+    lockfile: Path, min_coverage: float, lockfile_format: str, json_output: bool
+) -> None:
     """Fail the build if SRI coverage of the lockfile is below threshold.
 
     Pair with ``cas sri patch`` in a precommit or CI job so the lockfile
     is always integrity-complete before merge.
     """
+    fmt = _resolve_fmt(lockfile_format)
     try:
-        with_integrity, total = verify_lockfile(lockfile)
+        with_integrity, total = verify_lockfile(lockfile, fmt)
     except ValueError as exc:
         if json_output:
             emit_json(
@@ -289,6 +426,7 @@ def sri_verify(lockfile: Path, min_coverage: float, json_output: bool) -> None:
             {
                 "command": "sri-verify",
                 "lockfile": str(lockfile),
+                **_format_fields(lockfile, fmt),
                 "clean": not findings,
                 "covered": with_integrity,
                 "total": total,
@@ -338,6 +476,7 @@ def sri_verify(lockfile: Path, min_coverage: float, json_output: bool) -> None:
     "Also disables orphan-entry detection, since orphan detection requires "
     "walking the transitive graph.",
 )
+@_format_option()
 @click.option(
     "--json",
     "json_output",
@@ -348,14 +487,16 @@ def drift_cmd(
     frontend_dir: Path,
     ranges: bool,
     no_transitive: bool,
+    lockfile_format: str,
     json_output: bool,
 ) -> None:
-    """Fail if ``package.json`` and ``package-lock.json`` disagree on versions,
-    or if a lockfile entry is orphaned (unreachable from the dep graph).
+    """Fail if the manifest and lockfile disagree on versions, or if a lockfile
+    entry is orphaned (unreachable from the dep graph).
     """
     try:
-        report = check_npm_drift(
-            frontend_dir, ranges=ranges, transitive=not no_transitive
+        fmt = _probe_dir_format(frontend_dir, lockfile_format)
+        report = check_drift(
+            frontend_dir, fmt, ranges=ranges, transitive=not no_transitive
         )
     except FileNotFoundError as exc:
         if json_output:
@@ -422,6 +563,7 @@ def drift_cmd(
             {
                 "command": "drift",
                 "frontend_dir": str(frontend_dir),
+                **_format_fields(_dir_lockfile_path(frontend_dir, fmt), fmt),
                 "clean": report.clean,
                 "findings": findings,
                 "severity_counts": severity_counts(findings),
@@ -432,7 +574,7 @@ def drift_cmd(
         return
 
     if report.clean:
-        click.echo("OK — package.json and package-lock.json agree on declared versions.")
+        click.echo("OK — manifest and lockfile agree on declared versions.")
         return
 
     if report.mismatches:
@@ -473,14 +615,14 @@ def drift_cmd(
             )
         click.echo(
             "  These entries have no parent in the dep graph rooted at "
-            "package.json. The most plausible cause is lockfile tampering "
+            "the manifest. The most plausible cause is lockfile tampering "
             "(or a partial regeneration). Re-run "
-            "`npm install --package-lock-only --include=optional --force`.",
+            f"`{_REGEN_COMMANDS[fmt]}`.",
             err=True,
         )
 
     click.echo(
-        "\nFix: re-run `npm install --package-lock-only --include=optional --force` "
+        f"\nFix: re-run `{_REGEN_COMMANDS[fmt]}` "
         "and commit the regenerated lockfile.",
         err=True,
     )
@@ -527,6 +669,7 @@ def drift_cmd(
         "Implies --fail-on-git."
     ),
 )
+@_format_option()
 @click.option(
     "--json",
     "json_output",
@@ -538,13 +681,15 @@ def registry_cmd(
     allowed_hosts: tuple[str, ...],
     fail_on_git: bool,
     fail_on_exotic: bool,
+    lockfile_format: str,
     json_output: bool,
 ) -> None:
     """Fail the build if the lockfile resolves any package from a non-allowed host."""
     # Empty tuple from click when --allowed-host wasn't passed → auto-detect.
     allowed = allowed_hosts if allowed_hosts else None
+    fmt = _resolve_fmt(lockfile_format)
     try:
-        report = check_npm_registry(lockfile, allowed)
+        report = check_registry(lockfile, allowed, fmt)
     except ValueError as exc:
         _emit_load_error(json_output, "registry", lockfile, exc)
         sys.exit(1)
@@ -595,6 +740,23 @@ def registry_cmd(
                 "lockfile_key": key,
             }
         )
+    for key in report.registry_implied:
+        findings.append(
+            {
+                "severity": Severity.INFO.value,
+                "type": "registry_implied",
+                "lockfile_key": key,
+            }
+        )
+    for source, target in report.redirect_cross_host:
+        findings.append(
+            {
+                "severity": Severity.MEDIUM.value,
+                "type": "redirect_cross_host",
+                "source": source,
+                "target": target,
+            }
+        )
 
     is_failure = bool(report.leaked)
     if effective_fail_on_git and report.git_sourced:
@@ -607,10 +769,16 @@ def registry_cmd(
             {
                 "command": "registry",
                 "lockfile": str(lockfile),
+                **_format_fields(lockfile, fmt),
                 "clean": not is_failure,
                 "by_host": dict(report.by_host),
                 "mixed_registries": report.mixed,
                 "detected_primary_hosts": report.detected_primary_hosts,
+                "registry_implied": report.registry_implied,
+                "redirect_cross_host": [
+                    {"source": s, "target": t}
+                    for s, t in report.redirect_cross_host
+                ],
                 "auto_detect": not allowed_hosts,
                 "findings": findings,
                 "severity_counts": severity_counts(findings),
@@ -634,6 +802,22 @@ def registry_cmd(
         click.echo(f"  [{marker}] {host}: {count}")
     if report.mixed:
         click.echo("WARN — mixed registries: lockfile resolves from more than one host.")
+    if report.registry_implied:
+        click.echo(
+            f"INFO — {len(report.registry_implied)} entries resolve from the default "
+            "registry, which this lockfile format does not record per entry; "
+            "not host-gated."
+        )
+    if report.redirect_cross_host:
+        click.echo(
+            f"\nCross-host redirects ({len(report.redirect_cross_host)}):",
+            err=True,
+        )
+        for source, target in report.redirect_cross_host[:20]:
+            click.echo(
+                f"  {severity_badge(Severity.MEDIUM)} {source}  ->  {target}",
+                err=True,
+            )
 
     if report.leaked:
         click.echo(f"\nLeaked entries ({len(report.leaked)}):", err=True)
@@ -717,6 +901,7 @@ def registry_cmd(
         "typically need this — review and allowlist deliberately."
     ),
 )
+@_format_option()
 @click.option(
     "--json",
     "json_output",
@@ -726,16 +911,30 @@ def registry_cmd(
 def scripts_cmd(
     lockfile: Path,
     allowed: tuple[str, ...],
+    lockfile_format: str,
     json_output: bool,
 ) -> None:
     """Fail if any lockfile entry will run lifecycle scripts at install time."""
+    fmt = _resolve_fmt(lockfile_format)
     try:
-        report = check_install_scripts(lockfile, allowed=allowed)
+        report = check_install_scripts(lockfile, allowed=allowed, fmt=fmt)
     except ValueError as exc:
         _emit_load_error(json_output, "scripts", lockfile, exc)
         sys.exit(1)
 
     findings: list[dict[str, Any]] = []
+    if report.policy_unknown:
+        findings.append(
+            {
+                "severity": Severity.HIGH.value,
+                "type": "install_script_policy_unknown",
+                "message": (
+                    "pnpm lockfileVersion 9 records no install-script metadata "
+                    "and no onlyBuiltDependencies policy was found in "
+                    "pnpm-workspace.yaml or package.json#pnpm — failing closed"
+                ),
+            }
+        )
     for f in report.flagged:
         findings.append(
             {
@@ -762,7 +961,9 @@ def scripts_cmd(
             {
                 "command": "scripts",
                 "lockfile": str(lockfile),
+                **_format_fields(lockfile, fmt),
                 "clean": report.clean,
+                "script_info_available": report.script_info_available,
                 "findings": findings,
                 "severity_counts": severity_counts(findings),
             }
@@ -770,6 +971,29 @@ def scripts_cmd(
         if not report.clean:
             sys.exit(1)
         return
+
+    if report.trusted_mode:
+        click.echo(
+            "INFO — bun runs lifecycle scripts only for trustedDependencies "
+            "(plus its built-in default allowlist); auditing that list against "
+            "--allow. All other dependency scripts are blocked by bun."
+        )
+    elif not report.script_info_available:
+        click.echo(
+            "INFO — this lockfile format records no per-package install-script "
+            "flag; auditing the declared build policy (e.g. pnpm "
+            "onlyBuiltDependencies) instead."
+        )
+
+    if report.policy_unknown:
+        click.echo(
+            f"{severity_badge(Severity.HIGH)} FAIL — pnpm lockfileVersion 9 carries "
+            "no install-script metadata and no onlyBuiltDependencies policy was "
+            "found (pnpm-workspace.yaml or package.json#pnpm). Failing closed; "
+            "declare onlyBuiltDependencies to make the build surface explicit.",
+            err=True,
+        )
+        sys.exit(1)
 
     if report.allowed:
         click.echo(
@@ -850,6 +1074,7 @@ def scripts_cmd(
         "`--scope peerDependencies` to the default scope set."
     ),
 )
+@_format_option()
 @click.option(
     "--json",
     "json_output",
@@ -861,17 +1086,31 @@ def pin_cmd(
     allowed: tuple[str, ...],
     scopes: tuple[str, ...],
     include_peer: bool,
+    lockfile_format: str,
     json_output: bool,
 ) -> None:
     """Fail if any direct dep in package.json isn't pinned to an exact version."""
     scope_list = list(scopes) if scopes else list(DEFAULT_SCOPES)
+    forced = _resolve_fmt(lockfile_format)
+    has_deno_manifest = (project_dir / "deno.json").exists() or (
+        project_dir / "deno.jsonc"
+    ).exists()
+    use_deno = forced is LockFormat.DENO or (
+        forced is None
+        and has_deno_manifest
+        and not (project_dir / "package.json").exists()
+    )
+    fmt_label = "deno" if use_deno else lockfile_format
     try:
-        report = check_pinning(
-            project_dir,
-            allowed=allowed,
-            scopes=scope_list,
-            include_peer=include_peer,
-        )
+        if use_deno:
+            report = check_deno_pinning(project_dir, allowed=allowed)
+        else:
+            report = check_pinning(
+                project_dir,
+                allowed=allowed,
+                scopes=scope_list,
+                include_peer=include_peer,
+            )
     except FileNotFoundError as exc:
         if json_output:
             emit_json(
@@ -928,6 +1167,8 @@ def pin_cmd(
             {
                 "command": "pin",
                 "project_dir": str(project_dir),
+                "lockfile_format": fmt_label,
+                "format_version": "",
                 "clean": report.clean,
                 "scopes": effective_scopes,
                 "total_checked": report.total_checked,
@@ -1134,6 +1375,17 @@ _AUDIT_SEVERITY_TO_CAS = {
     ),
 )
 @click.option(
+    "--fail-on-unaudited-jsr",
+    is_flag=True,
+    envvar="CAS_FAIL_ON_UNAUDITED_JSR",
+    help=(
+        "Fail the build if any jsr package (deno.lock) can't be audited. "
+        "OSV has no JSR ecosystem, so jsr packages are reported as INFO "
+        "`unaudited_jsr` by default; this flag promotes them to a failure."
+    ),
+)
+@_format_option()
+@click.option(
     "--json",
     "json_output",
     is_flag=True,
@@ -1153,6 +1405,8 @@ def audit_cmd(
     retries: int,
     probe_cache_path: Path | None,
     osv_endpoints: tuple[str, ...],
+    fail_on_unaudited_jsr: bool,
+    lockfile_format: str,
     json_output: bool,
 ) -> None:
     """Query OSV.dev for known vulnerabilities in every (name, version) in the lockfile."""
@@ -1184,6 +1438,7 @@ def audit_cmd(
             sys.exit(1)
         trusted_endpoints.append(ca)
 
+    fmt = _resolve_fmt(lockfile_format)
     audit_kwargs: dict[str, Any] = {
         "allow_ids": allowed,
         "allow_unaudited": allow_unaudited,
@@ -1194,6 +1449,8 @@ def audit_cmd(
         "probe_cache_path": probe_cache_path,
         "max_workers": max_workers,
         "retries": retries,
+        "fmt": fmt,
+        "fail_on_unaudited_jsr": fail_on_unaudited_jsr,
     }
     if osv_endpoints:
         audit_kwargs["osv_endpoints"] = osv_endpoints
@@ -1209,6 +1466,7 @@ def audit_cmd(
                 {
                     "command": "audit",
                     "lockfile": str(lockfile),
+                    **_format_fields(lockfile, fmt),
                     "clean": False,
                     "total_checked": report.total_checked,
                     "findings": [
@@ -1263,12 +1521,33 @@ def audit_cmd(
                 "version": version,
             }
         )
+    jsr_severity = (
+        Severity.HIGH if report.fail_on_unaudited_jsr else Severity.INFO
+    )
+    for name, version in report.unaudited_jsr:
+        findings_payload.append(
+            {
+                "severity": jsr_severity.value,
+                "type": "unaudited_jsr",
+                "package": name,
+                "version": version,
+            }
+        )
+    if report.remote_skipped:
+        findings_payload.append(
+            {
+                "severity": Severity.INFO.value,
+                "type": "remote_modules_skipped",
+                "count": report.remote_skipped,
+            }
+        )
 
     if json_output:
         emit_json(
             {
                 "command": "audit",
                 "lockfile": str(lockfile),
+                **_format_fields(lockfile, fmt),
                 "clean": report.clean,
                 "total_checked": report.total_checked,
                 "findings": findings_payload,
@@ -1278,6 +1557,27 @@ def audit_cmd(
         if not report.clean:
             sys.exit(1)
         return
+
+    if report.remote_skipped:
+        click.echo(
+            f"INFO — {report.remote_skipped} remote https:// modules skipped "
+            "(no OSV coverage for URL modules)."
+        )
+    if report.unaudited_jsr:
+        sev = Severity.HIGH if report.fail_on_unaudited_jsr else Severity.INFO
+        click.echo(
+            f"{'' if not report.fail_on_unaudited_jsr else severity_badge(sev) + ' '}"
+            f"{len(report.unaudited_jsr)} jsr packages have no OSV ecosystem "
+            "and could not be audited:",
+            err=report.fail_on_unaudited_jsr,
+        )
+        for name, version in report.unaudited_jsr[:20]:
+            click.echo(
+                f"  {severity_badge(sev)} {name}@{version}",
+                err=report.fail_on_unaudited_jsr,
+            )
+        if report.fail_on_unaudited_jsr:
+            sys.exit(1)
 
     if not report.findings:
         click.echo(
@@ -1452,6 +1752,7 @@ def audit_cmd(
         "Shared with `cas audit` via `CAS_RETRIES`."
     ),
 )
+@_format_option()
 @click.option(
     "--json",
     "json_output",
@@ -1471,9 +1772,11 @@ def cooldown_cmd(
     cache_path: Path | None,
     max_workers: int,
     retries: int,
+    lockfile_format: str,
     json_output: bool,
 ) -> None:
     """Fail if any installed version is younger than --min-age days."""
+    fmt = _resolve_fmt(lockfile_format)
     endpoints: list[RegistryEndpoint] = []
     public = RegistryEndpoint(url=registry)
 
@@ -1510,6 +1813,7 @@ def cooldown_cmd(
             cache_path=cache_path,
             max_workers=max_workers,
             retries=retries,
+            fmt=fmt,
         )
     except ValueError as exc:
         _emit_load_error(json_output, "cooldown", lockfile, exc)
@@ -1564,12 +1868,29 @@ def cooldown_cmd(
                 "message": msg,
             }
         )
+    for entry in report.jsr_unresolved:
+        findings_payload.append(
+            {
+                "severity": Severity.INFO.value,
+                "type": "cooldown_jsr_unresolved",
+                "package": entry,
+            }
+        )
+    if report.remote_skipped:
+        findings_payload.append(
+            {
+                "severity": Severity.INFO.value,
+                "type": "cooldown_remote_skipped",
+                "count": report.remote_skipped,
+            }
+        )
 
     if json_output:
         emit_json(
             {
                 "command": "cooldown",
                 "lockfile": str(lockfile),
+                **_format_fields(lockfile, fmt),
                 "clean": report.clean,
                 "min_age_days": min_age_days,
                 "total_checked": report.total_checked,
@@ -1740,6 +2061,7 @@ def cooldown_cmd(
         "observed from the current lockfile. Requires --signers-file."
     ),
 )
+@_format_option()
 @click.option(
     "--json",
     "json_output",
@@ -1757,9 +2079,11 @@ def trust_cmd(
     verify_signatures: bool,
     signers_file: Path | None,
     update_signers: bool,
+    lockfile_format: str,
     json_output: bool,
 ) -> None:
     """Verify npm package attestations and detect trust-level downgrades."""
+    fmt = _resolve_fmt(lockfile_format)
     if (verify_signatures or update_signers) and not _sigstore_available():
         click.echo(
             "Error: --verify-signatures/--update-signers requires the 'sigstore' "
@@ -1788,6 +2112,7 @@ def trust_cmd(
             signer_manifest=manifest if signers_file else None,
             max_workers=max_workers,
             retries=retries,
+            fmt=fmt,
         )
     except ValueError as exc:
         _emit_load_error(json_output, "trust", lockfile, exc)
@@ -1881,6 +2206,7 @@ def trust_cmd(
             {
                 "command": "trust",
                 "lockfile": str(lockfile),
+                **_format_fields(lockfile, fmt),
                 "policy": policy,
                 "clean": not is_failure,
                 "total_checked": report.total_checked,

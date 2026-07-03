@@ -23,6 +23,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 from codeartifact_shield._lockfile import load_lockfile
+from codeartifact_shield.lockfiles import (
+    LockFormat,
+    NormalizedLockfile,
+    ResolvedKind,
+    load_normalized,
+)
 
 
 def _is_workspace_declaration(key: str, entry: dict[str, Any]) -> bool:
@@ -62,6 +68,19 @@ class RegistryReport:
     can distinguish legitimate ``bundleDependencies`` from suspicious phantoms.
     The SRI gate (``cas sri verify``) is what actually anchors these to the
     parent's integrity hash."""
+
+    redirect_cross_host: list[tuple[str, str]] = field(default_factory=list)
+    """``(source_url, target_url)`` for deno.lock ``redirects`` whose target host
+    differs from the source host. A cross-host redirect means the pinned URL a
+    reviewer reads is not where the bytes actually come from — reported as a
+    MEDIUM finding (does not fail the gate on its own)."""
+
+    registry_implied: list[str] = field(default_factory=list)
+    """Entries whose format doesn't record a resolution URL because the registry
+    is pinned out-of-band (pnpm/deno/bun install from the default registry
+    configured in ``.npmrc``/config, not per-entry). Reported as INFO — the
+    bytes still come from a registry, cas just can't name the host from the
+    lockfile alone, so these are never counted as leaks."""
 
     detected_primary_hosts: list[str] = field(default_factory=list)
     """When auto-detect is used (no explicit ``--allowed-host`` flags), the
@@ -258,5 +277,98 @@ def check_npm_registry(
             continue
         if not host_allowed(host, allowed):
             report.leaked.append((key, host))
+
+    return report
+
+
+def check_registry(
+    lockfile_path: Path,
+    allowed_hosts: Iterable[str] | None = None,
+    fmt: LockFormat | None = None,
+) -> RegistryReport:
+    """Format-dispatching entry point for the ``registry`` gate.
+
+    npm lockfiles run the original, byte-identical native path. Formats that
+    pin their registry out-of-band (pnpm) run the normalized path, which
+    host-gates only entries with explicit resolution URLs and reports the rest
+    as INFO ``registry_implied``.
+    """
+    normalized = load_normalized(lockfile_path, fmt)
+    if normalized.format is LockFormat.NPM:
+        return check_npm_registry(lockfile_path, allowed_hosts)
+    return _check_normalized_registry(normalized, allowed_hosts)
+
+
+def _check_normalized_registry(
+    normalized: NormalizedLockfile,
+    allowed_hosts: Iterable[str] | None,
+) -> RegistryReport:
+    """Registry gate over the normalized model (non-npm formats)."""
+    if allowed_hosts is None:
+        explicit_allowed: list[str] | None = None
+    else:
+        explicit_allowed = list(allowed_hosts)
+        if not explicit_allowed:
+            raise ValueError(
+                "at least one --allowed-host pattern is required "
+                "(or omit the flag entirely for auto-detect)"
+            )
+    auto_detect = explicit_allowed is None
+
+    histogram: dict[str, int] = {}
+    for entry in normalized.entries:
+        if entry.resolved_kind is not ResolvedKind.REGISTRY or not entry.resolved:
+            continue
+        parsed = urlparse(entry.resolved)
+        if parsed.scheme != "https":
+            continue
+        histogram[parsed.hostname or "(unknown)"] = (
+            histogram.get(parsed.hostname or "(unknown)", 0) + 1
+        )
+
+    if auto_detect:
+        primary = _auto_detect_primary_hosts(histogram)
+        allowed: list[str] = primary
+    else:
+        primary = []
+        allowed = explicit_allowed or []
+
+    report = RegistryReport()
+    report.detected_primary_hosts = primary
+    for entry in normalized.entries:
+        kind = entry.resolved_kind
+        if kind is ResolvedKind.REGISTRY_IMPLIED:
+            report.registry_implied.append(entry.key)
+            continue
+        if kind is ResolvedKind.FILE or kind is ResolvedKind.LINK:
+            report.file_sourced.append(entry.key)
+            continue
+        if kind is ResolvedKind.GIT:
+            report.git_sourced.append((entry.key, entry.resolved or ""))
+            continue
+        if kind is ResolvedKind.TARBALL:
+            report.tarball_sourced.append((entry.key, entry.resolved or ""))
+            continue
+        if kind is ResolvedKind.BUNDLED:
+            report.bundled.append(entry.key)
+            continue
+        if kind is not ResolvedKind.REGISTRY or not entry.resolved:
+            report.unresolved.append(entry.key)
+            continue
+        parsed = urlparse(entry.resolved)
+        host = parsed.hostname or "(unknown)"
+        report.by_host[host] = report.by_host.get(host, 0) + 1
+        if parsed.scheme != "https":
+            report.leaked.append(
+                (entry.key, f"{host} (insecure scheme: {parsed.scheme}://)")
+            )
+            continue
+        if not host_allowed(host, allowed):
+            report.leaked.append((entry.key, host))
+
+    if normalized.format is LockFormat.DENO and isinstance(normalized.raw, dict):
+        from codeartifact_shield.lockfiles.deno import cross_host_redirects
+
+        report.redirect_cross_host = cross_host_redirects(normalized.raw)
 
     return report

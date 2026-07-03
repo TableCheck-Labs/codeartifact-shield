@@ -1,8 +1,8 @@
 # codeartifact-shield
 
-npm supply-chain hardening for projects that proxy through **AWS CodeArtifact**
-(or use any internal registry, or stay on public npm — every command works for
-all three).
+npm, **pnpm**, **Deno**, and **Bun** supply-chain hardening for projects that
+proxy through **AWS CodeArtifact** (or use any internal registry, or stay on
+public npm — every command works across all four lockfile formats).
 
 ```
 cas drift       fail on package.json / package-lock.json disagreement
@@ -38,6 +38,122 @@ Every command:
 * refuses to operate on a structurally-suspect lockfile (path-traversal in
   package keys, malformed grammar, unsupported v1 format) with a clean
   `[HIGH] FAIL` line — never a Python traceback.
+
+---
+
+## Lockfile formats
+
+cas reads `package-lock.json` / `npm-shrinkwrap.json` (npm lockfileVersion 2
+and 3), `pnpm-lock.yaml` (pnpm lockfileVersion `6.0` and `9.0`), `deno.lock`
+(Deno lockfile `version` `3`, `4`, and `5`), and `bun.lock` (Bun's JSONC text
+lockfile, `lockfileVersion` `0` and `1`). The format is auto-detected from
+the filename, then from content; force it with `--format` (or the
+`CAS_LOCKFILE_FORMAT` env var) on any command:
+
+```bash
+cas registry ./pnpm-lock.yaml                       # auto-detected as pnpm
+cas sri verify ./some-lock.yaml --format pnpm        # force it
+CAS_LOCKFILE_FORMAT=pnpm cas scripts ./pnpm-lock.yaml
+cas audit ./deno.lock                                # audits npm deps, jsr → INFO
+cas scripts ./bun.lock                               # audits trustedDependencies
+```
+
+`--format` accepts `auto` (default), `npm`, `pnpm`, `deno`, `bun`.
+
+**Bun `bun.lockb` migration.** cas parses Bun's **text** lockfile (`bun.lock`),
+not the legacy **binary** `bun.lockb`. A `bun.lockb` is rejected with a clean
+`[HIGH] FAIL` (never a traceback) telling you to regenerate a text lockfile:
+
+```bash
+bun install --save-text-lockfile     # Bun >= 1.2 — writes bun.lock
+```
+
+For the directory commands (`cas drift`, `cas pin`) that take a project folder
+rather than a file, `auto` probes for a lockfile in the order
+`package-lock.json`, `pnpm-lock.yaml`, `bun.lock`, `deno.lock`. If **more than
+one** is present it refuses to guess — pass `--format` to disambiguate.
+
+### Command × format support matrix
+
+| Command | npm | pnpm | deno | bun |
+| --- | --- | --- | --- | --- |
+| `drift` | full | full | partial (direct + orphan) [4] | full (direct + transitive + orphan) [12] |
+| `sri verify` | full | full | full [5] | full [13] |
+| `sri patch` | full | **unsupported** [1] | **unsupported** [1] | **unsupported** [1] |
+| `registry` | full | partial [2] | partial [6] | partial [14] |
+| `scripts` | full | v6 full / v9 partial [3] | n/a — clean by design [7] | trustedDependencies audit [15] |
+| `pin` | full | full | full (deno.json imports) [8] | full |
+| `audit` | full | full | partial [9] | full |
+| `cooldown` | full | full | partial [10] | full |
+| `trust` | full | full | npm entries only [11] | full |
+
+1. `sri patch` backfills the integrity hashes CodeArtifact strips from
+   *npm-format* metadata responses; pnpm lockfiles already carry integrity from
+   registry metadata. If yours are missing it, re-resolve with
+   `pnpm install --lockfile-only`.
+2. pnpm pins the registry via `.npmrc`, not per lockfile entry, so
+   default-registry packages are reported as INFO `registry_implied` (never a
+   leak). Explicit tarball resolutions, git sources, and cross-registry
+   tarballs are still classified and host-gated exactly as for npm.
+3. pnpm lockfileVersion 6 records `requiresBuild`, so `scripts` gates it like
+   npm's `hasInstallScript`. lockfileVersion 9 **dropped** that field, so cas
+   instead audits the project's declared build policy
+   (`onlyBuiltDependencies` in `pnpm-workspace.yaml` or
+   `package.json#pnpm.onlyBuiltDependencies`) against `--allow`. If no build
+   policy is discoverable at all, `scripts` **fails closed** with
+   `install_script_policy_unknown` rather than passing blind.
+4. `deno drift` compares each `npm:`/`jsr:` import in `deno.json` against the
+   lockfile `specifiers` map and resolved versions, and flags npm/jsr lockfile
+   entries unreachable from those roots as orphans. Remote `https://` modules
+   are exact by construction, so there is no transitive-range check for them.
+5. Deno records sha512 for npm, sha256 for jsr, and sha256 for remote modules;
+   all count. The bare-hex sha256 that jsr/remote store on disk is normalized to
+   `sha256-<base64>` SRI form so coverage is comparable across ecosystems.
+6. deno host-gates its `remote` `https://` modules (and reports a MEDIUM
+   `redirect_cross_host` finding for any redirect that lands on a different
+   host). npm and jsr packages resolve from the registry configured out-of-band
+   and are reported as INFO `registry_implied`, never as leaks.
+7. Deno does not run npm lifecycle scripts unless you opt in with
+   `deno install --allow-scripts`, and the lockfile records no script flag, so
+   `scripts` exits `0` with an INFO note and never fails for `deno.lock`.
+8. `pin` on a project that has a `deno.json`/`deno.jsonc` and no `package.json`
+   audits the `imports` map: `npm:`/`jsr:` ranges and un-versioned `https://`
+   imports are flagged HIGH; exact versions and versioned `https://` imports
+   pass.
+9. npm dependencies are audited against OSV as usual. jsr packages have no OSV
+   ecosystem, so they are reported as INFO `unaudited_jsr` (promote to a failure
+   with `--fail-on-unaudited-jsr`). Remote `https://` modules are skipped with an
+   aggregate INFO.
+10. npm dependencies use npm-registry publish times; jsr packages query
+    `api.jsr.io` `createdAt`. A jsr package whose publish time can't be fetched
+    degrades to INFO `cooldown_jsr_unresolved` (not a build failure — the jsr
+    API shape can drift). Remote modules have no publish time and are skipped.
+11. npm attestations are verified as usual; jsr and remote entries have no
+    npm-style provenance endpoint and are skipped.
+12. `bun drift` compares each workspace's declared dependency spec against the
+    resolved version in the `packages` map (direct), verifies every package's
+    dependency edges resolve to a real entry via Bun's nested-before-hoisted
+    `/`-path rule (transitive), and flags any `packages` entry unreachable from
+    the workspace roots as an orphan. `workspace:`/`file:`/`link:` entries are
+    intra-repo and excluded from orphan detection.
+13. Bun records sha512 integrity in the package tuple's trailing element; it is
+    counted like npm's `integrity`. `workspace:` and `file:` entries carry no
+    upstream integrity (like npm `link` entries) and are excluded from the
+    coverage denominator.
+14. `bun.lock` records a per-entry registry URL only for non-default registries;
+    default-registry packages are reported as INFO `registry_implied` (never a
+    leak), and explicit registry, tarball, and git resolutions are classified
+    and host-gated exactly as for npm.
+15. Bun runs dependency lifecycle scripts **only** for packages listed in
+    `trustedDependencies` (plus its built-in default allowlist) — every other
+    dependency script is blocked. `scripts` therefore audits `trustedDependencies`
+    against `--allow`: each trusted package not allowlisted is a HIGH
+    `install_script` finding (there is no per-entry `hasInstallScript` flag to
+    read). Non-registry entries (`workspace:`/`file:`/`git`/`tarball`) carry no
+    registry version and are skipped by `audit`/`cooldown`/`trust`.
+
+Every JSON report includes `"lockfile_format"` and `"format_version"` fields
+(additive; back-compatible) so downstream tooling can tell what was parsed.
 
 ---
 
@@ -83,10 +199,13 @@ splits to `("@scope/pkg", "1.0.0")`.
 {
   "command": "registry",
   "lockfile": "/path/to/package-lock.json",
+  "lockfile_format": "npm",
+  "format_version": "3",
   "clean": false,
   "by_host": {"acme-1.d.codeartifact.us-east-1.amazonaws.com": 2790, "registry.npmjs.org": 1},
   "mixed_registries": true,
   "detected_primary_hosts": ["acme-1.d.codeartifact.us-east-1.amazonaws.com"],
+  "registry_implied": [],
   "auto_detect": true,
   "findings": [
     {"severity": "CRITICAL", "type": "registry_leak", "lockfile_key": "node_modules/sneaky", "host": "registry.npmjs.org"}
@@ -236,8 +355,10 @@ cas drift ./frontend --no-transitive  # direct strict only
 cas drift ./frontend --json
 ```
 
-Fix message includes the exact regen command:
-`npm install --package-lock-only --include=optional --force`. The `--force`
+Fix message includes the exact regen command for the detected format —
+`npm install --package-lock-only --include=optional --force`,
+`pnpm install --lockfile-only`, `deno install`, or
+`bun install --save-text-lockfile`. The npm `--force`
 matters — without it, npm prunes foreign-platform optional deps from the
 lockfile (npm/cli#4828, #7961) and the Docker build breaks at install time.
 
@@ -436,8 +557,17 @@ cas scripts [OPTIONS] LOCKFILE
 | Flag              | Behavior                                                                                          |
 | ----------------- | ------------------------------------------------------------------------------------------------- |
 | `--allow TEXT`    | Package permitted to run install scripts. Accepts `name` or `name@version` (see [Versioned allowlist syntax](#versioned-allowlist-syntax)). Repeatable. Env: `CAS_ALLOWED_SCRIPTS` (whitespace-separated). |
+| `--format TEXT`   | `auto` (default) / `npm` / `pnpm` / `deno` / `bun`. Env: `CAS_LOCKFILE_FORMAT`. For `bun.lock`, `scripts` audits `trustedDependencies` (see the [format matrix](#command--format-support-matrix)). |
 | `--json`          | Machine-readable JSON on stdout instead of human text.                                            |
 | `-h`, `--help`    | Show help.                                                                                        |
+
+**pnpm note.** For `pnpm-lock.yaml` lockfileVersion 6, `scripts` reads the
+`requiresBuild` flag just like npm's `hasInstallScript`. lockfileVersion 9
+removed per-package build metadata, so cas audits the project's
+`onlyBuiltDependencies` policy (from `pnpm-workspace.yaml` or
+`package.json#pnpm`) against `--allow` instead. With no discoverable policy it
+fails closed (`install_script_policy_unknown`) — declare
+`onlyBuiltDependencies` to make the build surface explicit.
 
 ```bash
 # Fail on any unaudited script-runner:
@@ -978,7 +1108,9 @@ next run.
 ## Lockfile structure validation
 
 Every command refuses to operate on a structurally-suspect lockfile
-before any other check runs. Specifically, the loader rejects:
+before any other check runs.
+
+**npm** (`package-lock.json`) — the loader rejects:
 
 * Lockfile version 1 (no per-entry `resolved` URLs; obsoletes the whole
   premise of SRI gating).
@@ -987,9 +1119,48 @@ before any other check runs. Specifically, the loader rejects:
 * Package keys containing null bytes or control characters.
 * Package keys with empty path segments (`node_modules//foo`).
 
+**pnpm** (`pnpm-lock.yaml`) — the loader rejects:
+
+* Any `lockfileVersion` other than `6.0` or `9.0` (a `5.x` lockfile is told to
+  regenerate with pnpm >= 8).
+* YAML anchors and aliases outright — pnpm never emits them, and alias
+  expansion is a classic YAML denial-of-service ("billion laughs"). The parser
+  also enforces a 100 MiB input cap and requires a mapping at the document root.
+* Package keys and importer paths containing `..`, backslashes, absolute
+  paths, empty segments, or control characters.
+* Non-`https` `resolution.tarball` URLs and `..` in `resolution.directory`.
+
+**Deno** (`deno.lock`) — the loader rejects:
+
+* Any lockfile `version` other than `3`, `4`, or `5` (a `1`/`2` file is told to
+  regenerate with a modern Deno).
+* npm/jsr package keys containing `..` path segments, backslashes, or control
+  characters.
+* Any `remote` or `redirects` URL that isn't `https://` with a non-empty host.
+* `remote` module hashes that aren't 64 lowercase hex characters (sha256).
+* Null bytes anywhere in the file.
+
+**Bun** (`bun.lock`) — the loader rejects:
+
+* Any `lockfileVersion` other than `0` or `1` (an unknown version is a hard
+  reject rather than a guess at an unseen tuple shape — regenerate with a
+  compatible Bun or upgrade cas).
+* Package keys and package names containing `..` path segments, backslashes, or
+  control characters.
+* `..` traversal in `file:`/`workspace:`/`link:` paths and in workspace paths.
+* Non-`https` registry URLs and non-`https` tarball URLs.
+* Null bytes anywhere in the file.
+* A `bun.lockb` (legacy **binary** lockfile) is refused outright with guidance
+  to run `bun install --save-text-lockfile` (Bun >= 1.2).
+
+`bun.lock` is JSONC and `deno.json` / `deno.jsonc` manifests (read by `drift`
+and `pin`) are parsed with an in-house strict JSONC reader — `//` and `/* */`
+comments and trailing commas are tolerated, but a **nested** block comment or an
+unterminated comment is a hard error.
+
 All of these emit `[HIGH] FAIL — <reason>` and exit `1` cleanly — never
-a Python traceback. The whole loader is shared across subcommands, so
-the check is consistent everywhere.
+a Python traceback. The loaders are shared across subcommands, so the check is
+consistent everywhere.
 
 ---
 
@@ -1116,11 +1287,15 @@ actual=$(cas --version | awk '{print $NF}')
 
 ## Scope and non-goals
 
-* **npm only.** Built for the CodeArtifact-vs-npm gap. pip / Maven /
-  NuGet / Cargo have their own integrity stories.
-* **Lockfile v2 and v3.** Older v1 lockfiles use a different structure and
-  aren't supported — every subcommand errors out so a v1 lockfile can't
-  accidentally pass a 100% gate. Regenerate the lockfile with Node 16+.
+* **JavaScript lockfiles only.** Built for the CodeArtifact-vs-JS-registry gap:
+  npm (`package-lock.json`), pnpm (`pnpm-lock.yaml`), Deno (`deno.lock`), and
+  Bun (`bun.lock`). pip / Maven / NuGet / Cargo have their own integrity stories
+  and are out of scope.
+* **npm lockfile v2 and v3.** Older npm v1 lockfiles use a different structure
+  and aren't supported — every subcommand errors out so a v1 lockfile can't
+  accidentally pass a 100% gate. Regenerate the lockfile with Node 16+. (pnpm
+  `6.0`/`9.0`, Deno `3`/`4`/`5`, and Bun `0`/`1` are the supported versions for
+  those formats.)
 * **No `.npmrc` parsing.** The lockfile is the source of truth for what
   `npm ci` will fetch.
 * **No deep dependency review.** `cas` doesn't fetch package contents or

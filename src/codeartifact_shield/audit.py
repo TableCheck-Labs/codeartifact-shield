@@ -25,12 +25,8 @@ from typing import Any
 
 from codeartifact_shield._allowlist import PackageAllowlist
 from codeartifact_shield._http import DEFAULT_RETRIES, with_retry
-from codeartifact_shield._lockfile import (
-    extract_package_name,
-    is_installable_entry,
-    load_lockfile,
-)
 from codeartifact_shield._registry import RegistryEndpoint, package_url
+from codeartifact_shield.lockfiles import Ecosystem, LockFormat, load_normalized
 
 OSV_DEFAULT_ENDPOINT = "https://api.osv.dev"
 OSV_TIMEOUT_SECONDS = 30
@@ -130,12 +126,28 @@ class AuditReport:
     """Same condition as ``unaudited_blocked`` but explicitly allowlisted.
     INFO-severity; doesn't fail the gate."""
 
+    unaudited_jsr: list[tuple[str, str]] = field(default_factory=list)
+    """``(name, version)`` jsr packages (deno.lock). OSV has no JSR ecosystem,
+    so cas cannot vouch for them. INFO by default; HIGH only when
+    ``fail_on_unaudited_jsr`` is set."""
+
+    remote_skipped: int = 0
+    """Count of deno.lock ``remote`` https:// modules skipped — they aren't
+    registry packages and have no OSV coverage. Aggregate INFO, never a
+    failure."""
+
+    fail_on_unaudited_jsr: bool = False
+    """Policy flag echoed onto the report so ``clean`` knows whether unaudited
+    jsr packages should fail the gate."""
+
     @property
     def clean(self) -> bool:
+        jsr_ok = not self.fail_on_unaudited_jsr or not self.unaudited_jsr
         return (
             not self.findings
             and not self.unaudited_blocked
             and self.network_error is None
+            and jsr_ok
         )
 
 
@@ -532,6 +544,8 @@ def audit_lockfile(
     max_workers: int = DEFAULT_PROBE_WORKERS,
     retries: int = DEFAULT_RETRIES,
     timeout: int = OSV_TIMEOUT_SECONDS,
+    fmt: LockFormat | None = None,
+    fail_on_unaudited_jsr: bool = False,
 ) -> AuditReport:
     """Audit every (name, version) pair in the lockfile against OSV-compatible endpoints.
 
@@ -555,21 +569,30 @@ def audit_lockfile(
             deduplicated at finding emit time via alias-overlap union-find.
         timeout: HTTP timeout in seconds, applied per request.
     """
-    lock = load_lockfile(lockfile_path)
-    pkgs: dict[str, dict[str, Any]] = lock.get("packages", {})
+    normalized = load_normalized(lockfile_path, fmt)
 
     seen: dict[tuple[str, str], None] = {}
-    for key, entry in pkgs.items():
-        if not is_installable_entry(key, entry):
+    jsr_seen: dict[tuple[str, str], None] = {}
+    remote_skipped = 0
+    for e in normalized.entries:
+        if e.ecosystem is Ecosystem.JSR:
+            if e.name and e.version:
+                jsr_seen[(e.name, e.version)] = None
             continue
-        name = extract_package_name(key, entry)
-        version = entry.get("version")
-        if not name or not isinstance(version, str):
+        if e.ecosystem is Ecosystem.REMOTE:
+            remote_skipped += 1
             continue
-        seen[(name, version)] = None
+        if not e.name or not e.version:
+            continue
+        seen[(e.name, e.version)] = None
 
     pkg_list = list(seen)
-    report = AuditReport(total_checked=len(pkg_list))
+    report = AuditReport(
+        total_checked=len(pkg_list),
+        unaudited_jsr=sorted(jsr_seen),
+        remote_skipped=remote_skipped,
+        fail_on_unaudited_jsr=fail_on_unaudited_jsr,
+    )
     if not pkg_list:
         return report
 

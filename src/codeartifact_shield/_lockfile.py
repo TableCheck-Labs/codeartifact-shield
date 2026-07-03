@@ -1,115 +1,26 @@
-"""Shared lockfile helpers — structural validation and entry parsing.
+"""Shared npm lockfile helpers — re-export shim over ``lockfiles.npm``.
 
-A tampered lockfile can carry path-traversal payloads in its package-key
-strings. cas treats those keys as opaque labels (we never filesystem-resolve
-them), but ``npm`` at install time uses them as install paths — a key like
-``node_modules/../etc/passwd`` would write outside the project root. Fail
-closed at lockfile-read time so no downstream check operates on a structurally
-suspect lockfile.
+The npm-native loader/validator/entry-parser moved into
+``codeartifact_shield.lockfiles.npm`` when cas grew multi-format support. This
+module stays as a stable re-export so every existing
+``from codeartifact_shield._lockfile import ...`` keeps working unchanged.
+
+See :mod:`codeartifact_shield.lockfiles.npm` for the implementation and the
+security rationale for structural validation.
 """
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-from typing import Any
+from codeartifact_shield.lockfiles.npm import (
+    _validate_package_keys,
+    extract_package_name,
+    is_installable_entry,
+    load_lockfile,
+)
 
-
-def load_lockfile(lockfile_path: Path) -> dict[str, Any]:
-    """Read a lockfile from disk, validate its structure, and return it.
-
-    Raises ``ValueError`` for unsupported versions (v1) or any structural
-    anomaly that should cause cas to refuse to operate further on the file.
-    """
-    lock: dict[str, Any] = json.loads(lockfile_path.read_text())
-    lf_version = lock.get("lockfileVersion")
-    if lf_version not in (2, 3):
-        raise ValueError(
-            f"unsupported lockfileVersion {lf_version}; only v2 and v3 are supported"
-        )
-    _validate_package_keys(lock)
-    return lock
-
-
-def is_installable_entry(key: str, entry: dict[str, Any]) -> bool:
-    """True iff this ``packages`` entry represents a real registry install.
-
-    npm v7+ lockfiles for workspace projects carry three classes of entry:
-
-    1. **The root** — empty-string key (``""``). The project itself.
-    2. **Workspace declarations** — keys like ``apps/foo``, ``libs/bar``,
-       ``system/i18n``. The workspace's own manifest. These have a real
-       ``version`` but they're NOT installed via the registry.
-    3. **Installed packages** — keys like ``node_modules/<name>`` or
-       ``node_modules/<a>/node_modules/<b>`` (and the workspace's own
-       symlink as ``node_modules/<workspace-name>`` with ``link: true``).
-       These are the things cas should examine.
-
-    Workspace declarations (class 2) regularly slipped past the
-    previous filter (only ``key == ""`` and ``link: true`` were
-    rejected) and got probed against the public registry, where they
-    don't exist — surfacing as bogus ``private_blocked`` /
-    ``unaudited_private`` / orphan findings. This helper closes that
-    gap by requiring the key to live under ``node_modules/``.
-    """
-    if not key:
-        return False
-    if not key.startswith("node_modules/"):
-        return False
-    return not entry.get("link")
-
-
-def extract_package_name(key: str, entry: dict[str, Any] | None = None) -> str:
-    """Return the canonical npm package name for a lockfile entry.
-
-    Prefers the entry's ``name`` field, which npm sets for aliased entries
-    (e.g. ``"string-width-cjs": "npm:string-width@4.2.3"`` in package.json
-    produces ``packages["node_modules/string-width-cjs"].name == "string-width"``).
-    Falls back to the last ``node_modules/<name>`` segment of the key when
-    no ``name`` field is present (the common case for non-aliased deps).
-
-    Getting this right is load-bearing for every subcommand that queries
-    a registry by name (cooldown, audit), since the alias name doesn't
-    exist on npm and would always 404.
-    """
-    if entry is not None:
-        name = entry.get("name")
-        if isinstance(name, str) and name:
-            return name
-    marker = "/node_modules/"
-    idx = key.rfind(marker)
-    tail = key[idx + len(marker) :] if idx != -1 else key
-    if tail.startswith("node_modules/"):
-        tail = tail[len("node_modules/") :]
-    return tail
-
-
-def _validate_package_keys(lock: dict[str, Any]) -> None:
-    """Reject lockfile keys that could be path-traversal payloads.
-
-    Every non-root key must be a sequence of ``node_modules/<name>`` segments.
-    Anything outside that grammar (``..``, leading ``/``, null bytes,
-    backslashes, control chars) is rejected loudly — these are tampering
-    signatures, not legitimate npm output.
-    """
-    pkgs = lock.get("packages", {})
-    if not isinstance(pkgs, dict):
-        raise ValueError("`packages` must be an object in lockfileVersion 2/3")
-    for key in pkgs:
-        if key == "":
-            continue
-        if not isinstance(key, str):
-            raise ValueError(f"non-string package key: {key!r}")
-        if "\x00" in key or "\n" in key or "\r" in key:
-            raise ValueError(f"control character in package key: {key!r}")
-        if key.startswith("/") or key.startswith("\\"):
-            raise ValueError(f"absolute path in package key: {key!r}")
-        # Segment-by-segment check: every '..' segment is forbidden, and
-        # leading segment must be 'node_modules' (or 'apps'/'libs'/... for
-        # workspace layouts — but those don't have `..` either).
-        segments = key.replace("\\", "/").split("/")
-        if ".." in segments:
-            raise ValueError(f"path traversal in package key: {key!r}")
-        if "" in segments:
-            # Empty segment from '//' or trailing slash — also suspicious.
-            raise ValueError(f"empty path segment in package key: {key!r}")
+__all__ = [
+    "_validate_package_keys",
+    "extract_package_name",
+    "is_installable_entry",
+    "load_lockfile",
+]

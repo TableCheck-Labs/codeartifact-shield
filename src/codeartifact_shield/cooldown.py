@@ -51,16 +51,13 @@ from typing import Any
 
 from codeartifact_shield._allowlist import PackageAllowlist
 from codeartifact_shield._http import DEFAULT_RETRIES, with_retry
-from codeartifact_shield._lockfile import (
-    extract_package_name,
-    is_installable_entry,
-    load_lockfile,
-)
 from codeartifact_shield._registry import (
+    JsrEndpoint,
     RegistryEndpoint,
     build_codeartifact_endpoint,
     package_url,
 )
+from codeartifact_shield.lockfiles import Ecosystem, LockFormat, load_normalized
 
 # Re-export so existing `from codeartifact_shield.cooldown import RegistryEndpoint`
 # imports keep working after the refactor.
@@ -70,6 +67,7 @@ __all__ = [
     "DEFAULT_REGISTRY",
     "CooldownFinding",
     "CooldownReport",
+    "JsrEndpoint",
     "RegistryEndpoint",
     "build_codeartifact_endpoint",
     "check_cooldown",
@@ -119,6 +117,16 @@ class CooldownReport:
     private_allowed: list[str] = field(default_factory=list)
     """(name, version) pairs unresolvable on any endpoint AND explicitly
     allowlisted via ``allow_private``. INFO-severity; do not fail the gate."""
+
+    jsr_unresolved: list[str] = field(default_factory=list)
+    """jsr ``@scope/name@version`` pairs (deno.lock) whose publish time couldn't
+    be fetched from api.jsr.io. INFO-severity — the jsr API shape can drift, so
+    an unresolvable jsr package degrades to an informational note rather than
+    failing the whole build the way an unresolvable npm package does."""
+
+    remote_skipped: int = 0
+    """Count of deno.lock ``remote`` https:// modules skipped — they have no
+    registry publish time. Aggregate INFO, never a failure."""
 
     network_errors: list[str] = field(default_factory=list)
     total_checked: int = 0
@@ -289,6 +297,77 @@ def _fetch_endpoint_parallel(
     return results
 
 
+def _parse_jsr_versions(payload: Any) -> dict[str, str]:
+    """Turn a jsr ``/versions`` response into ``{version: createdAt}``.
+
+    Tolerant of the two shapes the API has used: a bare JSON array of version
+    objects, or an object wrapping them under ``items``. Each object carries
+    ``version`` and ``createdAt``.
+    """
+    if isinstance(payload, dict):
+        items = payload.get("items", payload.get("versions", []))
+    else:
+        items = payload
+    out: dict[str, str] = {}
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            ver = item.get("version")
+            created = item.get("createdAt")
+            if isinstance(ver, str) and isinstance(created, str):
+                out[ver] = created
+    return out
+
+
+def _fetch_jsr_versions_one(
+    endpoint: JsrEndpoint,
+    name: str,
+    timeout: int,
+    retries: int = DEFAULT_RETRIES,
+) -> dict[str, str]:
+    """Fetch ``{version: createdAt}`` for one jsr package. Empty dict on any
+    failure — the caller treats an empty map as an unresolvable INFO."""
+    try:
+        url = endpoint.versions_url(name)
+    except ValueError:
+        return {}
+    try:
+        payload = _http_get_json(url, timeout=timeout, retries=retries)
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+        json.JSONDecodeError,
+    ):
+        return {}
+    return _parse_jsr_versions(payload)
+
+
+def _fetch_jsr_versions_parallel(
+    endpoint: JsrEndpoint,
+    names: Iterable[str],
+    timeout: int,
+    max_workers: int,
+    retries: int = DEFAULT_RETRIES,
+) -> dict[str, dict[str, str]]:
+    results: dict[str, dict[str, str]] = {}
+    name_list = list(names)
+    if not name_list:
+        return results
+    workers = max(1, min(max_workers, len(name_list)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(
+                _fetch_jsr_versions_one, endpoint, name, timeout, retries
+            ): name
+            for name in name_list
+        }
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Main entry — orchestrate cache + parallel fetch + per-version fallthrough
 # ---------------------------------------------------------------------------
@@ -305,6 +384,7 @@ def check_cooldown(
     retries: int = DEFAULT_RETRIES,
     timeout: int = COOLDOWN_TIMEOUT_SECONDS,
     now: datetime | None = None,
+    fmt: LockFormat | None = None,
 ) -> CooldownReport:
     """Audit the lockfile, flagging any (name, version) younger than the threshold.
 
@@ -326,22 +406,27 @@ def check_cooldown(
 
     endpoint_list = list(endpoints) or [RegistryEndpoint(url=DEFAULT_REGISTRY)]
 
-    lock = load_lockfile(lockfile_path)
-    pkgs: dict[str, dict[str, Any]] = lock.get("packages", {})
+    normalized = load_normalized(lockfile_path, fmt)
 
     pending: dict[tuple[str, str], None] = {}
-    for key, entry in pkgs.items():
-        if not is_installable_entry(key, entry):
+    jsr_pending: dict[tuple[str, str], None] = {}
+    remote_skipped = 0
+    for e in normalized.entries:
+        if e.ecosystem is Ecosystem.JSR:
+            if e.name and e.version:
+                jsr_pending[(e.name, e.version)] = None
             continue
-        name = extract_package_name(key, entry)
-        version = entry.get("version")
-        if not name or not isinstance(version, str):
+        if e.ecosystem is Ecosystem.REMOTE:
+            remote_skipped += 1
             continue
-        pending[(name, version)] = None
+        if not e.name or not e.version:
+            continue
+        pending[(e.name, e.version)] = None
 
     allowlist = PackageAllowlist.from_entries(allowed)
     private_allowlist = PackageAllowlist.from_entries(allow_private)
-    report = CooldownReport(total_checked=len(pending))
+    report = CooldownReport(total_checked=len(pending) + len(jsr_pending))
+    report.remote_skipped = remote_skipped
 
     cache: PublishCache = load_cache(cache_path) if cache_path else {}
 
@@ -433,6 +518,27 @@ def check_cooldown(
         for nv in resolved_here:
             pending.pop(nv, None)
             pending_errors.pop(nv[0], None)
+
+    # jsr packages (deno.lock): resolve publish times from api.jsr.io. One
+    # HTTP call per unique jsr package name; unresolvable jsr → INFO (not a
+    # build failure — see CooldownReport.jsr_unresolved).
+    if jsr_pending:
+        jsr_endpoint = JsrEndpoint()
+        jsr_names = sorted({name for (name, _) in jsr_pending})
+        jsr_times = _fetch_jsr_versions_parallel(
+            jsr_endpoint,
+            jsr_names,
+            timeout=timeout,
+            max_workers=max_workers,
+            retries=retries,
+        )
+        for name, version in jsr_pending:
+            time_map = jsr_times.get(name)
+            published_str = time_map.get(version) if time_map else None
+            if isinstance(published_str, str):
+                resolve(name, version, published_str, jsr_endpoint.label)
+            else:
+                report.jsr_unresolved.append(f"{name}@{version}")
 
     for name, version in pending:
         nv_label = f"{name}@{version}"

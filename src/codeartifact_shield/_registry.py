@@ -35,6 +35,41 @@ class RegistryEndpoint:
             self.label = parsed.netloc or self.url
 
 
+JSR_DEFAULT_API = "https://api.jsr.io"
+
+
+def _split_jsr_name(package_name: str) -> tuple[str, str]:
+    """Split a jsr package name ``@scope/name`` into ``(scope, name)``.
+
+    The leading ``@`` is stripped from the scope. Raises ``ValueError`` for a
+    name that isn't in ``@scope/name`` form.
+    """
+    if not package_name.startswith("@") or "/" not in package_name:
+        raise ValueError(f"not a jsr @scope/name package: {package_name!r}")
+    scope, name = package_name[1:].split("/", 1)
+    return scope, name
+
+
+@dataclass
+class JsrEndpoint:
+    """The jsr.io registry API — for querying jsr package publish times.
+
+    jsr packages (``@scope/name``) carry a ``createdAt`` timestamp per version
+    at ``/scopes/{scope}/packages/{name}/versions``. Used by ``cas cooldown``
+    to age-gate deno.lock jsr dependencies the same way npm deps are gated.
+    """
+
+    url: str = JSR_DEFAULT_API
+    label: str = "jsr.io"
+
+    def versions_url(self, package_name: str) -> str:
+        scope, name = _split_jsr_name(package_name)
+        base = self.url.rstrip("/")
+        scope_q = urllib.parse.quote(scope)
+        name_q = urllib.parse.quote(name)
+        return f"{base}/scopes/{scope_q}/packages/{name_q}/versions"
+
+
 def package_url(endpoint: RegistryEndpoint, package_name: str) -> str:
     """Build the GET URL for one package's metadata on a registry."""
     base = endpoint.url.rstrip("/")

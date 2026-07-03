@@ -1,0 +1,11 @@
+lockfileVersion: '6.0'
+
+packages:
+
+  /a@1.0.0:
+    resolution: &r {integrity: sha512-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa==}
+    dev: false
+
+  /b@1.0.0:
+    resolution: *r
+    dev: false

@@ -645,3 +645,269 @@ def test_trust_require_provenance_fails_on_none(tmp_path: Path) -> None:
     assert result.exit_code == 1
     payload = json.loads(result.stdout)
     assert payload["clean"] is False
+
+
+# ---------------------------------------------------------------------------
+# Phase A — multi-format CLI plumbing (--format, JSON format fields, pnpm)
+# ---------------------------------------------------------------------------
+
+PNPM_FIXTURES = Path(__file__).parent / "fixtures" / "pnpm"
+
+
+def _stage_pnpm(tmp_path: Path, fixture: str) -> Path:
+    import shutil
+
+    dest = tmp_path / "pnpm-lock.yaml"
+    shutil.copy(PNPM_FIXTURES / fixture, dest)
+    return dest
+
+
+def test_json_payloads_include_format_fields(tmp_path: Path) -> None:
+    """Every command's JSON gains lockfile_format / format_version (additive)."""
+    lf = _write_lock(
+        tmp_path,
+        {
+            "node_modules/lodash": {
+                "version": "4.17.21",
+                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                "integrity": "sha512-" + "a" * 86 + "==",
+            }
+        },
+    )
+    result = CliRunner().invoke(main, ["sri", "verify", str(lf), "--json"])
+    payload = json.loads(result.stdout)
+    assert payload["lockfile_format"] == "npm"
+    assert payload["format_version"] == "3"
+
+
+def test_registry_format_flag_forces_pnpm(tmp_path: Path) -> None:
+    lf = _stage_pnpm(tmp_path, "lock-v6-basic.yaml")
+    result = CliRunner().invoke(
+        main, ["registry", str(lf), "--format", "pnpm", "--json"]
+    )
+    payload = json.loads(result.stdout)
+    assert payload["lockfile_format"] == "pnpm"
+    assert payload["format_version"] == "6.0"
+    assert payload["registry_implied"]
+    # git + tarball sources are informational unless --fail-on-exotic is set.
+    result_exotic = CliRunner().invoke(
+        main, ["registry", str(lf), "--format", "pnpm", "--fail-on-exotic"]
+    )
+    assert result_exotic.exit_code == 1
+
+
+def test_sri_verify_pnpm_autodetected(tmp_path: Path) -> None:
+    lf = _stage_pnpm(tmp_path, "lock-v9-basic.yaml")
+    result = CliRunner().invoke(main, ["sri", "verify", str(lf), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["lockfile_format"] == "pnpm"
+    assert payload["covered"] == payload["total"] == 5
+
+
+def test_scripts_pnpm_v9_fails_closed_without_policy(tmp_path: Path) -> None:
+    lf = _stage_pnpm(tmp_path, "lock-v9-basic.yaml")
+    result = CliRunner().invoke(main, ["scripts", str(lf), "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    types = {f["type"] for f in payload["findings"]}
+    assert "install_script_policy_unknown" in types
+
+
+def test_sri_patch_pnpm_unsupported_clean_error(tmp_path: Path) -> None:
+    lf = _stage_pnpm(tmp_path, "lock-v6-basic.yaml")
+    result = CliRunner().invoke(
+        main, ["sri", "patch", str(lf), "--domain", "d", "--repository", "r"]
+    )
+    assert result.exit_code == 1
+    assert "[HIGH] FAIL" in result.stderr
+    assert "pnpm" in result.stderr
+
+
+def test_unknown_format_bun_fails_cleanly_not_traceback(tmp_path: Path) -> None:
+    """bun.lockb (legacy binary) is refused with a clean [HIGH] FAIL, never a trace."""
+    lf = tmp_path / "bun.lockb"
+    lf.write_bytes(b"\x00\x01binary-bun-lockfile")
+    result = CliRunner().invoke(main, ["registry", str(lf)])
+    assert result.exit_code == 1
+    assert "[HIGH] FAIL" in result.stderr
+    assert "save-text-lockfile" in result.stderr
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_bun_scripts_fails_on_untrusted_dependency(tmp_path: Path) -> None:
+    """`cas scripts bun.lock` fails when a trustedDependency isn't allowlisted."""
+    lf = tmp_path / "bun.lock"
+    lf.write_text(
+        '{"lockfileVersion":1,"trustedDependencies":["is-odd"],"packages":{'
+        '"is-odd":["is-odd@3.0.1","",{},"sha512-CQpnWPrDwmP1+SMHXZhtLtJv90yiyVfluGsX5'
+        'iNCVkrhQtU3TQHsUWPG9wkdk9Lgd5yNpAg9jQEo90CBaXgWMA=="]}}'
+    )
+    result = CliRunner().invoke(main, ["scripts", str(lf)])
+    assert result.exit_code == 1
+    assert "is-odd" in result.stderr
+
+
+def test_bun_scripts_clean_when_allowlisted(tmp_path: Path) -> None:
+    lf = tmp_path / "bun.lock"
+    lf.write_text('{"lockfileVersion":1,"trustedDependencies":["is-odd"],"packages":{}}')
+    result = CliRunner().invoke(main, ["scripts", str(lf), "--allow", "is-odd"])
+    assert result.exit_code == 0
+
+
+def test_bun_registry_json_reports_format(tmp_path: Path) -> None:
+    lf = tmp_path / "bun.lock"
+    lf.write_text('{"lockfileVersion":1,"workspaces":{"":{"name":"r"}},"packages":{}}')
+    result = CliRunner().invoke(main, ["registry", str(lf), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["lockfile_format"] == "bun"
+    assert payload["format_version"] == "1"
+
+
+def test_bun_format_override(tmp_path: Path) -> None:
+    """--format bun forces the bun adapter even for a non-standard filename."""
+    lf = tmp_path / "custom.lock"
+    lf.write_text('{"lockfileVersion":1,"workspaces":{"":{"name":"r"}},"packages":{}}')
+    result = CliRunner().invoke(main, ["registry", str(lf), "--format", "bun", "--json"])
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["lockfile_format"] == "bun"
+
+
+def test_deno_registry_now_runs_cleanly(tmp_path: Path) -> None:
+    """Phase B: an empty deno.lock parses and the registry gate exits 0."""
+    lf = tmp_path / "deno.lock"
+    lf.write_text(json.dumps({"version": "4", "specifiers": {}}))
+    result = CliRunner().invoke(main, ["registry", str(lf), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["lockfile_format"] == "deno"
+    assert payload["format_version"] == "4"
+
+
+def test_drift_multiple_lockfiles_requires_disambiguation(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(json.dumps({"name": "x"}))
+    (tmp_path / "package-lock.json").write_text(
+        json.dumps({"lockfileVersion": 3, "packages": {}})
+    )
+    _stage_pnpm(tmp_path, "lock-v9-workspace.yaml")
+    result = CliRunner().invoke(main, ["drift", str(tmp_path)])
+    assert result.exit_code == 1
+    assert "multiple lockfiles" in result.stderr
+
+
+def test_drift_pnpm_autoprobe(tmp_path: Path) -> None:
+    _stage_pnpm(tmp_path, "lock-v9-workspace.yaml")
+    result = CliRunner().invoke(main, ["drift", str(tmp_path), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["lockfile_format"] == "pnpm"
+    assert payload["clean"] is True
+
+
+# ---------------------------------------------------------------------------
+# Phase B — Deno CLI plumbing
+# ---------------------------------------------------------------------------
+
+DENO_FIXTURES = Path(__file__).parent / "fixtures" / "deno"
+
+
+def _stage_deno(tmp_path: Path, lock: str = "lock-v4.json") -> Path:
+    import shutil
+
+    dest = tmp_path / "deno.lock"
+    shutil.copy(DENO_FIXTURES / lock, dest)
+    return dest
+
+
+def test_deno_sri_verify_json_fields(tmp_path: Path) -> None:
+    lf = _stage_deno(tmp_path)
+    result = CliRunner().invoke(main, ["sri", "verify", str(lf), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["lockfile_format"] == "deno"
+    assert payload["format_version"] == "4"
+    assert payload["covered"] == payload["total"] == 5
+
+
+def test_deno_sri_patch_unsupported_clean_error(tmp_path: Path) -> None:
+    lf = _stage_deno(tmp_path)
+    result = CliRunner().invoke(
+        main, ["sri", "patch", str(lf), "--domain", "d", "--repository", "r"]
+    )
+    assert result.exit_code == 1
+    assert "[HIGH] FAIL" in result.stderr
+
+
+def test_deno_registry_cross_host_redirect_in_json(tmp_path: Path) -> None:
+    lf = _stage_deno(tmp_path, "lock-v5.json")
+    result = CliRunner().invoke(main, ["registry", str(lf), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["redirect_cross_host"] == [
+        {
+            "source": "https://deno.land/x/foo/mod.ts",
+            "target": "https://cdn.other-host.example/foo/mod.ts",
+        }
+    ]
+
+
+def test_deno_scripts_exits_zero(tmp_path: Path) -> None:
+    lf = _stage_deno(tmp_path)
+    result = CliRunner().invoke(main, ["scripts", str(lf), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["clean"] is True
+    assert payload["script_info_available"] is False
+
+
+def test_deno_audit_jsr_info_not_failing(tmp_path: Path) -> None:
+    lf = _stage_deno(tmp_path)
+
+    def mock_post(url, body, timeout, retries=2):
+        return {"results": [{} for _ in body.get("queries", [])]}
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_post):
+        result = CliRunner().invoke(main, ["audit", str(lf), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["clean"] is True
+    types = {f["type"] for f in payload["findings"]}
+    assert "unaudited_jsr" in types
+
+
+def test_deno_audit_fail_on_unaudited_jsr(tmp_path: Path) -> None:
+    lf = _stage_deno(tmp_path)
+
+    def mock_post(url, body, timeout, retries=2):
+        return {"results": [{} for _ in body.get("queries", [])]}
+
+    with patch("codeartifact_shield.audit._http_post_json", mock_post):
+        result = CliRunner().invoke(
+            main, ["audit", str(lf), "--fail-on-unaudited-jsr", "--json"]
+        )
+    assert result.exit_code == 1
+
+
+def test_deno_pin_autodetects_deno_json(tmp_path: Path) -> None:
+    import shutil
+
+    shutil.copy(DENO_FIXTURES / "deno.json", tmp_path / "deno.json")
+    result = CliRunner().invoke(main, ["pin", str(tmp_path), "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["lockfile_format"] == "deno"
+    packages = {f["package"] for f in payload["findings"]}
+    assert "chalk" in packages
+
+
+def test_deno_drift_autoprobe(tmp_path: Path) -> None:
+    import shutil
+
+    _stage_deno(tmp_path)
+    shutil.copy(DENO_FIXTURES / "deno.json", tmp_path / "deno.json")
+    result = CliRunner().invoke(main, ["drift", str(tmp_path), "--ranges", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["lockfile_format"] == "deno"
+    assert payload["clean"] is True

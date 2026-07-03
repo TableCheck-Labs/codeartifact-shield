@@ -1,0 +1,10 @@
+{
+  "version": "4",
+  "specifiers": {},
+  "npm": {},
+  "jsr": {},
+  "remote": {
+    "http://insecure.example/mod.ts": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "redirects": {}
+}

@@ -1,0 +1,38 @@
+{
+  // bun.lock — hand-crafted fixture. Exercises JSONC (this line comment, the
+  // block comment below, and trailing commas) plus every source kind bun can
+  // record: default-registry, custom-registry, git, tarball, workspace, file.
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "root",
+      "dependencies": {
+        "is-number": "6.0.0",
+        "is-odd": "3.0.1",
+        "left-pad": "1.3.0",
+      },
+    },
+  },
+  /* bun runs lifecycle scripts only for the packages listed here */
+  "trustedDependencies": [
+    "is-odd",
+    "esbuild",
+  ],
+  "packages": {
+    "is-number": ["is-number@6.0.0", "", {}, "sha512-Wu1VHeILBK8KAWJUAiSZQX94GmOE45Rg6/538fKwiloUu21KncEkYGPqob2oSZ5mUT73vLGrHQjKw3KMPwfDzg=="],
+
+    "is-odd": ["is-odd@3.0.1", "", { "dependencies": { "is-number": "^6.0.0" } }, "sha512-CQpnWPrDwmP1+SMHXZhtLtJv90yiyVfluGsX5iNCVkrhQtU3TQHsUWPG9wkdk9Lgd5yNpAg9jQEo90CBaXgWMA=="],
+
+    "left-pad": ["left-pad@1.3.0", "", {}, "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="],
+
+    "scoped-registry-pkg": ["scoped-registry-pkg@1.0.0", "https://npm.example.com/", {}, "sha512-dMInicTPVE8d1e5otfwmmjlxkZoUpiVLwyeTdUsi/Caj/gfzzblBcCE5sRHV/AsjuCmxWrte2TNGSYuCeCq+0Q=="],
+
+    "gitdep": ["gitdep@github:example/gitdep#abc1234", { "dependencies": {} }, "example-gitdep-abc1234", "sha512-dBA2mPdaaMASZEc3d1TdKuruk6i+kArDS+nCR3oXlsUS0zVz4RhN7aKVmvB8FVdLiRpySuoBPRXd8I3A1IDf8Q=="],
+
+    "tardep": ["tardep@https://registry.npmjs.org/tardep/-/tardep-1.0.0.tgz", {}, "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="],
+
+    "linkdep": ["linkdep@workspace:packages/linkdep"],
+
+    "filedep": ["filedep@file:vendor/filedep", {}],
+  }
+}

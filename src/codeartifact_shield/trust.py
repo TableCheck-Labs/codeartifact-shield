@@ -24,11 +24,7 @@ from typing import Any
 
 from codeartifact_shield._allowlist import PackageAllowlist
 from codeartifact_shield._http import DEFAULT_RETRIES, with_retry
-from codeartifact_shield._lockfile import (
-    extract_package_name,
-    is_installable_entry,
-    load_lockfile,
-)
+from codeartifact_shield.lockfiles import Ecosystem, LockFormat, load_normalized
 
 PROVENANCE_PREDICATE = "https://slsa.dev/provenance/v1"
 PUBLISH_PREDICATE = (
@@ -359,6 +355,7 @@ def check_trust(
     max_workers: int = DEFAULT_WORKERS,
     timeout: int = DEFAULT_TIMEOUT,
     retries: int = DEFAULT_RETRIES,
+    fmt: LockFormat | None = None,
 ) -> TrustReport:
     """Audit trust levels for every installable package in the lockfile.
 
@@ -375,18 +372,18 @@ def check_trust(
         timeout: Per-request HTTP timeout in seconds.
         retries: Number of retries per request.
     """
-    lock = load_lockfile(lockfile_path)
-    pkgs: dict[str, dict[str, Any]] = lock.get("packages", {})
+    normalized = load_normalized(lockfile_path, fmt)
     allowlist = PackageAllowlist.from_entries(allow)
     private_allowlist = PackageAllowlist.from_entries(allow_private)
 
     seen: dict[tuple[str, str], None] = {}
-    for key, entry in pkgs.items():
-        if not is_installable_entry(key, entry):
+    for e in normalized.entries:
+        # npm attestations are the only provenance model cas can verify; jsr and
+        # remote (deno.lock) entries have no npm-registry attestation endpoint.
+        if e.ecosystem is not Ecosystem.NPM:
             continue
-        name = extract_package_name(key, entry)
-        version = entry.get("version")
-        if not name or not isinstance(version, str):
+        name, version = e.name, e.version
+        if not name or not version:
             continue
         if allowlist.allows(name, version):
             continue

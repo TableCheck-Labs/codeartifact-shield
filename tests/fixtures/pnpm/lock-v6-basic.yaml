@@ -1,0 +1,50 @@
+lockfileVersion: '6.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+dependencies:
+  is-odd:
+    specifier: 3.0.1
+    version: 3.0.1
+  native-mod:
+    specifier: 1.0.0
+    version: 1.0.0
+  forked-dep:
+    specifier: github:example/forked-dep#master
+    version: github.com/example/forked-dep/1111111111111111111111111111111111111111
+  tarball-dep:
+    specifier: https://example.com/tarball-dep-1.0.0.tgz
+    version: /@example/tarball-dep@1.0.0
+
+packages:
+
+  /is-number@6.0.0:
+    resolution: {integrity: sha512-Wu1VHeILBK8KAWJUAiSZQX94GmOE45Rg6/538fKwiloUu21KncEkYGPqob2oSZ5mUT73vLGrHQjKw3KMPwfDzg==}
+    engines: {node: '>=0.10.0'}
+    dev: false
+
+  /is-odd@3.0.1:
+    resolution: {integrity: sha512-CQpnWPrDwmP1+SMHXZhtLtJv90yiyVfluGsX5iNCVkrhQtU3TQHsUWPG9wkdk9Lgd5yNpAg9jQEo90CBaXgWMA==}
+    engines: {node: '>=4'}
+    dependencies:
+      is-number: 6.0.0
+    dev: false
+
+  /native-mod@1.0.0:
+    resolution: {integrity: sha512-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa==}
+    requiresBuild: true
+    dev: false
+
+  github.com/example/forked-dep/1111111111111111111111111111111111111111:
+    resolution: {tarball: https://codeload.github.com/example/forked-dep/tar.gz/1111111111111111111111111111111111111111}
+    name: forked-dep
+    version: 2.0.0
+    dev: false
+
+  /@example/tarball-dep@1.0.0:
+    resolution: {tarball: https://example.com/tarball-dep-1.0.0.tgz}
+    name: '@example/tarball-dep'
+    version: 1.0.0
+    dev: false

@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any
 
 from codeartifact_shield._lockfile import load_lockfile
+from codeartifact_shield.lockfiles import LockFormat, load_normalized
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +148,11 @@ def _has_strong_integrity(entry: dict[str, Any]) -> bool:
     The bare ``integrity`` field is a string; older or hand-rolled lockfiles
     might carry a non-string value. Defensive against that.
     """
-    integrity = entry.get("integrity")
+    return _integrity_is_strong(entry.get("integrity"))
+
+
+def _integrity_is_strong(integrity: Any) -> bool:
+    """True iff ``integrity`` is a non-empty SRI string with a strong algorithm."""
     if not isinstance(integrity, str) or not integrity:
         return False
     for part in integrity.split():
@@ -325,7 +330,9 @@ def patch_lockfile(
     return report
 
 
-def verify_lockfile(lockfile_path: Path) -> tuple[int, int]:
+def verify_lockfile(
+    lockfile_path: Path, fmt: LockFormat | None = None
+) -> tuple[int, int]:
     """Return ``(covered, total)`` for installable lockfile entries.
 
     *Covered* means the entry's bytes are integrity-anchored — either by
@@ -339,12 +346,31 @@ def verify_lockfile(lockfile_path: Path) -> tuple[int, int]:
     Raises ``ValueError`` for unsupported lockfile versions (v1) — silently
     returning 0/0 would let a v1 lockfile pass a 100%-coverage gate.
     """
-    lock = load_lockfile(lockfile_path)
-    pkgs: dict[str, dict[str, Any]] = lock.get("packages", {})
+    normalized = load_normalized(lockfile_path, fmt)
+    if normalized.format is LockFormat.NPM:
+        lock = normalized.raw
+        pkgs: dict[str, dict[str, Any]] = lock.get("packages", {})
+        total = 0
+        covered = 0
+        for key, entry in _iter_lockfile_packages(lock):
+            total += 1
+            if _is_integrity_covered(key, entry, pkgs):
+                covered += 1
+        return covered, total
+
+    # Generic path: bundle-anchoring is npm-only (no other format sets
+    # ``parent_key`` / ``is_bundled``), so coverage reduces to "strong SRI on
+    # the entry's own integrity string." Local link/file entries carry no
+    # upstream integrity by construction (like npm ``link`` entries, which the
+    # npm path already excludes) — they don't belong in the denominator.
+    from codeartifact_shield.lockfiles import ResolvedKind
+
     total = 0
     covered = 0
-    for key, entry in _iter_lockfile_packages(lock):
+    for entry_model in normalized.entries:
+        if entry_model.resolved_kind in (ResolvedKind.LINK, ResolvedKind.FILE):
+            continue
         total += 1
-        if _is_integrity_covered(key, entry, pkgs):
+        if _integrity_is_strong(entry_model.integrity):
             covered += 1
     return covered, total

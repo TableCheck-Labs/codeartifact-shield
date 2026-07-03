@@ -31,6 +31,7 @@ from typing import Any
 import nodesemver
 
 from codeartifact_shield._lockfile import is_installable_entry, load_lockfile
+from codeartifact_shield.lockfiles import LockFormat, ResolvedKind, load_normalized
 
 # nodesemver logs an INFO entry with a traceback for every range it can't parse
 # (e.g. ``github:org/repo#ref``, ``npm:other-name@^1.x``). We intercept the
@@ -229,6 +230,459 @@ def check_npm_drift(
         report.orphan_entries = _find_orphan_entries(pkg, lock_pkgs)
 
     return report
+
+
+def check_drift(
+    project_dir: Path,
+    fmt: LockFormat,
+    *,
+    ranges: bool = False,
+    transitive: bool = True,
+) -> DriftReport:
+    """Format-dispatching entry point for the ``drift`` gate.
+
+    ``fmt`` is resolved by the CLI (which probes the directory and disambiguates
+    multiple lockfiles). npm keeps the byte-identical native path; pnpm uses the
+    importer/snapshot graph.
+    """
+    if fmt is LockFormat.NPM:
+        return check_npm_drift(project_dir, ranges=ranges, transitive=transitive)
+    if fmt is LockFormat.PNPM:
+        return check_pnpm_drift(project_dir, ranges=ranges, transitive=transitive)
+    if fmt is LockFormat.DENO:
+        return check_deno_drift(project_dir, ranges=ranges, transitive=transitive)
+    if fmt is LockFormat.BUN:
+        return check_bun_drift(project_dir, ranges=ranges, transitive=transitive)
+    raise ValueError(f"drift is not supported for {fmt.value} lockfiles")
+
+
+def _pnpm_base(version_spec: str) -> str:
+    """Strip a pnpm resolved-version's peer suffix: ``1.2.3(x@4)`` -> ``1.2.3``."""
+    paren = version_spec.find("(")
+    return version_spec[:paren] if paren != -1 else version_spec
+
+
+def check_pnpm_drift(
+    project_dir: Path,
+    *,
+    ranges: bool = False,
+    transitive: bool = True,
+) -> DriftReport:
+    """Compare ``pnpm-lock.yaml`` importer declarations to resolved versions.
+
+    Direct drift compares each importer dependency's ``specifier`` against its
+    resolved ``version``. Transitive drift verifies every package's dependency
+    edges point at a real ``name@version`` in the lockfile (a dangling edge is a
+    tampering signature). Orphan detection walks the importer roots and flags
+    any ``packages`` entry unreachable from them.
+    """
+    lock_path = project_dir / "pnpm-lock.yaml"
+    if not lock_path.exists():
+        raise FileNotFoundError(f"no pnpm-lock.yaml in {project_dir}")
+    normalized = load_normalized(lock_path, LockFormat.PNPM)
+    lock: dict[str, Any] = normalized.raw
+    importers = lock.get("importers")
+    if not isinstance(importers, dict) or not importers:
+        # Single-package v6 lockfile: top-level dependencies act as importer ".".
+        root_block: dict[str, Any] = {}
+        for scope in ("dependencies", "devDependencies", "optionalDependencies"):
+            block = lock.get(scope)
+            if isinstance(block, dict):
+                root_block[scope] = block
+        importers = {".": root_block} if root_block else {}
+
+    report = DriftReport()
+
+    entries = normalized.entries
+    by_key = {e.key: e for e in entries}
+    # Map base ``name@version`` -> the package's native key, so a resolved
+    # version string can be turned into the entry it points at.
+    base_to_key: dict[str, str] = {f"{e.name}@{e.version}": e.key for e in entries}
+
+    def resolve_node(name: str, resolved: str) -> str | None:
+        """Turn a ``(dep name, resolved version-string)`` edge into a package key."""
+        if resolved in by_key:
+            # git/tarball entries: the resolved string *is* the package key.
+            return resolved
+        base = f"{name}@{_pnpm_base(resolved)}"
+        return base_to_key.get(base)
+
+    # ---- Direct deps (importer specifier vs resolved version) ----------------
+    for importer_path, blocks in importers.items():
+        if not isinstance(blocks, dict):
+            continue
+        for kind in ("dependencies", "devDependencies", "optionalDependencies"):
+            block = blocks.get(kind)
+            if not isinstance(block, dict):
+                continue
+            for name, info in block.items():
+                if isinstance(info, dict):
+                    declared = str(info.get("specifier", ""))
+                    resolved = str(info.get("version", ""))
+                else:
+                    declared = str(info)
+                    resolved = str(info)
+                actual = _pnpm_base(resolved)
+                if actual.startswith("link:") or declared.startswith("workspace:"):
+                    # Intra-workspace link — resolved on-repo, not a drift.
+                    continue
+                label = name if importer_path in ("", ".") else f"{importer_path}:{name}"
+                if ranges:
+                    outcome = _satisfies(actual, declared)
+                    if outcome is False:
+                        report.mismatches.append((kind, label, declared, actual))
+                else:
+                    if not _is_semver_declaration(declared):
+                        continue
+                    if actual != declared:
+                        report.mismatches.append((kind, label, declared, actual))
+
+    # ---- Transitive deps (edges must reference a real package) ---------------
+    if transitive:
+        for entry in entries:
+            parent_base = f"{entry.name}@{entry.version}"
+            for dep_kind, deps in (
+                ("dependencies", entry.dependencies),
+                ("optionalDependencies", entry.optional_dependencies),
+            ):
+                for child_name, child_version in deps.items():
+                    if resolve_node(child_name, str(child_version)) is not None:
+                        continue
+                    if dep_kind != "dependencies":
+                        continue
+                    report.transitive_mismatches.append(
+                        (parent_base, child_name, str(child_version), "MISSING")
+                    )
+
+        # ---- Orphan detection: BFS over package keys from importer roots -----
+        reachable: set[str] = set()
+        queue: list[str] = []
+        for blocks in importers.values():
+            if not isinstance(blocks, dict):
+                continue
+            for kind in ("dependencies", "devDependencies", "optionalDependencies"):
+                block = blocks.get(kind)
+                if not isinstance(block, dict):
+                    continue
+                for name, info in block.items():
+                    resolved = info.get("version", "") if isinstance(info, dict) else info
+                    if isinstance(resolved, str) and resolved.startswith("link:"):
+                        continue
+                    node = resolve_node(name, str(resolved))
+                    if node is not None:
+                        queue.append(node)
+        while queue:
+            node = queue.pop()
+            if node in reachable:
+                continue
+            reachable.add(node)
+            cur = by_key.get(node)
+            if cur is None:
+                continue
+            for deps in (cur.dependencies, cur.optional_dependencies):
+                for child_name, child_version in deps.items():
+                    child = resolve_node(child_name, str(child_version))
+                    if child is not None and child not in reachable:
+                        queue.append(child)
+        report.orphan_entries = sorted(set(by_key) - reachable)
+
+    return report
+
+
+def _resolve_bun_key(
+    parent_key: str, child: str, pkg_keys: set[str]
+) -> str | None:
+    """Resolve a bun dependency edge to a ``packages`` key.
+
+    Bun keys nested (version-conflicted) packages by a ``/``-separated install
+    path, e.g. ``is-even/is-odd/is-number``. Resolution mirrors npm's
+    nested-before-hoisted rule: for a parent at ``a/b`` and child ``x`` the
+    candidates are ``a/b/x``, then ``a/x``, then the hoisted ``x``; the first
+    that exists wins.
+    """
+    if parent_key:
+        base = parent_key
+        while True:
+            candidate = f"{base}/{child}"
+            if candidate in pkg_keys:
+                return candidate
+            idx = base.rfind("/")
+            if idx == -1:
+                break
+            base = base[:idx]
+    return child if child in pkg_keys else None
+
+
+def check_bun_drift(
+    project_dir: Path,
+    *,
+    ranges: bool = False,
+    transitive: bool = True,
+) -> DriftReport:
+    """Compare ``bun.lock`` workspace declarations to resolved package versions.
+
+    Direct drift compares each workspace importer's declared dependency spec to
+    the resolved version in the ``packages`` map. Transitive drift walks every
+    package's own dependency edges and verifies each child resolves to a real
+    entry (a dangling edge is a tampering signature). Orphan detection BFS-walks
+    the workspace roots and flags any ``packages`` entry left unreachable.
+    """
+    lock_path = project_dir / "bun.lock"
+    if not lock_path.exists():
+        raise FileNotFoundError(f"no bun.lock in {project_dir}")
+    normalized = load_normalized(lock_path, LockFormat.BUN)
+
+    entries = normalized.entries
+    by_key = {e.key: e for e in entries}
+    pkg_keys = set(by_key)
+    name_to_keys: dict[str, list[str]] = {}
+    for e in entries:
+        name_to_keys.setdefault(e.name, []).append(e.key)
+
+    def top_level_version(name: str) -> str | None:
+        """Resolved version for a workspace-declared dependency (hoisted first)."""
+        if name in by_key:
+            return by_key[name].version
+        keys = name_to_keys.get(name)
+        return by_key[keys[0]].version if keys else None
+
+    report = DriftReport()
+
+    # ---- Direct deps (workspace declaration vs resolved version) -------------
+    for importer_path, blocks in normalized.workspaces.items():
+        for kind in ("dependencies", "devDependencies", "optionalDependencies"):
+            block = blocks.get(kind)
+            if not isinstance(block, dict):
+                continue
+            for name, declared in block.items():
+                declared = str(declared)
+                if declared.startswith(("workspace:", "link:", "file:")):
+                    # Intra-repo link — resolved on-repo, not a drift.
+                    continue
+                actual = top_level_version(name)
+                label = name if importer_path in ("", ".") else f"{importer_path}:{name}"
+                if actual is None:
+                    report.mismatches.append((kind, label, declared, "MISSING"))
+                    continue
+                if ranges:
+                    outcome = _satisfies(actual, declared)
+                    if outcome is False:
+                        report.mismatches.append((kind, label, declared, actual))
+                else:
+                    if not _is_semver_declaration(declared):
+                        continue
+                    if actual != declared:
+                        report.mismatches.append((kind, label, declared, actual))
+
+    # ---- Transitive deps (edges must reference a real package) --------------
+    if transitive:
+        for entry in entries:
+            parent_base = f"{entry.name}@{entry.version}"
+            for dep_kind, deps in (
+                ("dependencies", entry.dependencies),
+                ("optionalDependencies", entry.optional_dependencies),
+            ):
+                for child_name, child_range in deps.items():
+                    if _resolve_bun_key(entry.key, child_name, pkg_keys) is not None:
+                        continue
+                    if dep_kind != "dependencies":
+                        continue
+                    report.transitive_mismatches.append(
+                        (parent_base, child_name, str(child_range), "MISSING")
+                    )
+
+        # ---- Orphan detection: BFS over package keys from workspace roots ----
+        reachable: set[str] = set()
+        queue: list[str] = []
+        for blocks in normalized.workspaces.values():
+            for kind in ("dependencies", "devDependencies", "optionalDependencies"):
+                block = blocks.get(kind)
+                if not isinstance(block, dict):
+                    continue
+                for name in block:
+                    node = _resolve_bun_key("", name, pkg_keys)
+                    if node is not None:
+                        queue.append(node)
+        while queue:
+            node = queue.pop()
+            if node in reachable:
+                continue
+            reachable.add(node)
+            cur = by_key.get(node)
+            if cur is None:
+                continue
+            for deps in (cur.dependencies, cur.optional_dependencies):
+                for child_name in deps:
+                    child = _resolve_bun_key(node, child_name, pkg_keys)
+                    if child is not None and child not in reachable:
+                        queue.append(child)
+        # workspace: link entries are the workspaces themselves, not orphans.
+        linkish = {
+            e.key
+            for e in entries
+            if e.resolved_kind in (ResolvedKind.LINK, ResolvedKind.FILE)
+        }
+        report.orphan_entries = sorted(pkg_keys - reachable - linkish)
+
+    return report
+
+
+def check_deno_drift(
+    project_dir: Path,
+    *,
+    ranges: bool = False,
+    transitive: bool = True,
+) -> DriftReport:
+    """Compare ``deno.json`` imports to ``deno.lock`` resolutions (direct only).
+
+    Direct drift: every ``npm:``/``jsr:`` import in ``deno.json`` must appear in
+    the lockfile ``specifiers`` map, and the resolved version must satisfy the
+    declared range (``--ranges``) or equal it (default). Missing specifiers are
+    reported as ``MISSING``.
+
+    Orphan detection (``transitive`` on): npm/jsr lockfile entries not reachable
+    from the ``specifiers`` roots are flagged. Remote ``https://`` modules are
+    exact by construction, so there is no transitive range check for them.
+    """
+    from codeartifact_shield.lockfiles.deno import (
+        manifest_imports,
+        read_deno_manifest,
+    )
+
+    lock_path = project_dir / "deno.lock"
+    if not lock_path.exists():
+        raise FileNotFoundError(f"no deno.lock in {project_dir}")
+    normalized = load_normalized(lock_path, LockFormat.DENO)
+    specifiers: dict[str, str] = dict(
+        normalized.workspaces.get("", {}).get("dependencies", {})
+    )
+    manifest = read_deno_manifest(project_dir)
+    imports = manifest_imports(manifest)
+
+    report = DriftReport()
+
+    # ---- Direct deps (deno.json import spec vs lockfile resolution) ----------
+    for _alias, value in imports.items():
+        if not (value.startswith("npm:") or value.startswith("jsr:")):
+            continue
+        resolved = specifiers.get(value)
+        # deno's specifiers map is keyed by the request spec (e.g. "npm:chalk@^5").
+        label = value
+        if resolved is None:
+            report.mismatches.append(("imports", label, value, "MISSING"))
+            continue
+        declared_range = _deno_range(value)
+        actual = _deno_resolved_version(resolved)
+        if not actual:
+            continue
+        if ranges:
+            outcome = _satisfies(actual, declared_range)
+            if outcome is False:
+                report.mismatches.append(("imports", label, value, actual))
+        else:
+            if not _is_semver_declaration(declared_range):
+                continue
+            if actual != declared_range:
+                report.mismatches.append(("imports", label, value, actual))
+
+    # ---- Orphan detection over the npm + jsr dependency graph ----------------
+    if transitive:
+        report.orphan_entries = _deno_orphans(normalized, specifiers)
+
+    return report
+
+
+def _deno_range(spec: str) -> str:
+    """Extract the version range from a ``npm:``/``jsr:`` import specifier."""
+    body = spec.split(":", 1)[1] if ":" in spec else spec
+    at = body.find("@", 1)
+    return body[at + 1 :] if at != -1 else ""
+
+
+def _deno_resolved_version(resolved: str) -> str:
+    """Extract the bare version from a specifiers-map value.
+
+    Handles both the prefixed v3 form (``npm:chalk@5.3.0``) and the bare v4/v5
+    form (``5.3.0``).
+    """
+    if resolved.startswith(("npm:", "jsr:")):
+        body = resolved.split(":", 1)[1]
+        at = body.find("@", 1)
+        return body[at + 1 :] if at != -1 else body
+    return resolved
+
+
+def _deno_orphans(
+    normalized: Any, specifiers: dict[str, str]
+) -> list[str]:
+    """Return npm/jsr lockfile keys unreachable from the ``specifiers`` roots."""
+    from codeartifact_shield.lockfiles._model import Ecosystem
+
+    pkg_entries = {
+        e.key: e
+        for e in normalized.entries
+        if e.ecosystem in (Ecosystem.NPM, Ecosystem.JSR)
+    }
+    base_to_key = {f"{e.name}@{e.version}": e.key for e in pkg_entries.values()}
+    name_to_keys: dict[str, list[str]] = {}
+    for e in pkg_entries.values():
+        name_to_keys.setdefault(e.name, []).append(e.key)
+
+    def resolve_key(resolved: str) -> str | None:
+        if resolved in pkg_entries:
+            return resolved
+        body = _strip_deno_prefix(resolved)
+        if body in pkg_entries:
+            return body
+        return base_to_key.get(body)
+
+    reachable: set[str] = set()
+    queue: list[str] = []
+    for spec_key, resolved in specifiers.items():
+        # v4/v5 specifier values are bare versions (the name lives in the key);
+        # v3 values carry the ``npm:``/``jsr:`` prefix. Recover name+version.
+        name = _split_deno_spec_name(spec_key)
+        version = _deno_resolved_version(resolved)
+        node = resolve_key(resolved)
+        if node is None and name:
+            node = base_to_key.get(f"{name}@{version}")
+        if node is None and name:
+            keys = name_to_keys.get(name)
+            node = keys[0] if keys else None
+        if node is not None:
+            queue.append(node)
+    while queue:
+        node = queue.pop()
+        if node in reachable:
+            continue
+        reachable.add(node)
+        entry = pkg_entries.get(node)
+        if entry is None:
+            continue
+        for child_name, child_version in entry.dependencies.items():
+            # Child deps carry a range (jsr) or an exact version (npm); try an
+            # exact base match, then fall back to name-only (a range points at
+            # whatever the lockfile resolved for that name).
+            exact = base_to_key.get(f"{child_name}@{child_version}")
+            candidates = [exact] if exact else name_to_keys.get(child_name, [])
+            for child in candidates:
+                if child is not None and child not in reachable:
+                    queue.append(child)
+    return sorted(set(pkg_entries) - reachable)
+
+
+def _strip_deno_prefix(value: str) -> str:
+    for prefix in ("npm:", "jsr:"):
+        if value.startswith(prefix):
+            return value[len(prefix) :]
+    return value
+
+
+def _split_deno_spec_name(spec_key: str) -> str:
+    """Extract the package name from a specifier key (``npm:chalk@^5`` -> chalk)."""
+    body = _strip_deno_prefix(spec_key)
+    at = body.find("@", 1)
+    return body[:at] if at != -1 else body
 
 
 def _find_orphan_entries(

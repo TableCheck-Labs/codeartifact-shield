@@ -191,6 +191,90 @@ def _classify(spec: str) -> str | None:
     return "unknown"
 
 
+_DENO_VERSIONED_URL = re.compile(r"@[0-9]")
+
+
+def _classify_deno_import(value: str) -> tuple[str, str] | None:
+    """Classify a deno.json import value.
+
+    Returns ``None`` if the import is acceptably pinned, else ``(kind, spec)``:
+
+    * ``npm:name@<range>`` / ``jsr:@s/name@<range>`` — the embedded spec is run
+      through the npm classifier (exact version OK, range flagged).
+    * ``https://…@1.2.3/…`` — a versioned remote URL is OK; an un-versioned
+      ``https://`` import is flagged ``remote_unversioned`` (the bytes can
+      change under a stable URL).
+    * bare/relative specifiers (``./mod.ts``, ``node:fs``) — not a remote
+      dependency, exempt.
+    """
+    s = value.strip()
+    for prefix in ("npm:", "jsr:"):
+        if s.startswith(prefix):
+            body = s[len(prefix) :]
+            at = body.find("@", 1)
+            spec = body[at + 1 :] if at != -1 else ""
+            if not spec:
+                return ("range", value)
+            kind = _classify(spec)
+            return (kind, value) if kind is not None else None
+    if s.startswith("https://"):
+        if _DENO_VERSIONED_URL.search(s):
+            return None
+        return ("remote_unversioned", value)
+    if s.startswith("http://"):
+        return ("insecure_url", value)
+    # ./relative, node: builtins, bare aliases resolved elsewhere — exempt.
+    return None
+
+
+def check_deno_pinning(
+    project_dir: Path,
+    allowed: Iterable[str] = (),
+) -> PinsReport:
+    """Audit a Deno project's ``deno.json[c]`` ``imports`` for unpinned specs.
+
+    npm/jsr imports must carry an exact version; ``https://`` imports must be
+    versioned. Ranges, dist-tags, and un-versioned remote URLs are flagged HIGH.
+
+    Raises:
+        FileNotFoundError: if no ``deno.json`` / ``deno.jsonc`` is present.
+    """
+    from codeartifact_shield.lockfiles.deno import (
+        manifest_imports,
+        read_deno_manifest,
+    )
+
+    if not (
+        (project_dir / "deno.json").exists()
+        or (project_dir / "deno.jsonc").exists()
+    ):
+        raise FileNotFoundError(f"no deno.json or deno.jsonc in {project_dir}")
+
+    manifest = read_deno_manifest(project_dir)
+    imports = manifest_imports(manifest)
+    allowlist = {name.lower() for name in allowed}
+    report = PinsReport()
+
+    for alias, value in imports.items():
+        report.total_checked += 1
+        classified = _classify_deno_import(value)
+        if classified is None:
+            continue
+        kind, declared = classified
+        finding = PinFinding(
+            scope="imports",
+            package_name=alias,
+            declared=declared,
+            kind=kind,
+        )
+        if alias.lower() in allowlist:
+            report.allowed.append(finding)
+        else:
+            report.flagged.append(finding)
+
+    return report
+
+
 def check_pinning(
     project_dir: Path,
     allowed: Iterable[str] = (),

@@ -1,0 +1,12 @@
+lockfileVersion: '6.0'
+
+dependencies:
+  evil:
+    specifier: 1.0.0
+    version: 1.0.0
+
+packages:
+
+  /..@1.0.0/evil:
+    resolution: {integrity: sha512-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa==}
+    dev: false

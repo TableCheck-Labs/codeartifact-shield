@@ -1,0 +1,7 @@
+{
+  "imports": {
+    "chalk": "npm:chalk@^5",
+    "@std/assert": "jsr:@std/assert@^1",
+    "foo": "https://deno.land/x/foo@1.2.3/mod.ts"
+  }
+}
